@@ -2297,6 +2297,53 @@ export function useCanvas() {
     void sendPersist(id)
   }
 
+  function focusAgentNode(nodeId: string) {
+    const card = cardsRef.current.find(item => item.id === nodeId)
+    if (!card) return
+    setSelectedIds([nodeId])
+    frameCards([card])
+  }
+
+  async function prepareAgentTurn() {
+    const id = canvasId
+    const token = sessionTokenRef.current
+    if (!id || !docLoaded) throw new Error('画布尚未加载')
+    flushPersistNow(id)
+    const deadline = Date.now() + 15000
+    // A UI save label is not a receipt; inspect the persistence queue itself.
+    while (Date.now() < deadline) {
+      if (sessionTokenRef.current !== token) throw new Error('画布已切换')
+      if (saveConflictRef.current || localRestoreRef.current) throw new Error('请先处理画布版本冲突')
+      const dirty = saveDirtyRef.current[id]
+      if (!dirty?.full && !dirty?.view && !saveInFlightRef.current[id] && !saveTimerRef.current[id]) return
+      await new Promise(resolve => setTimeout(resolve, 80))
+    }
+    throw new Error('画布尚未同步，请稍后发送')
+  }
+
+  async function syncAgentRevision(revision: number) {
+    const id = canvasId
+    const token = sessionTokenRef.current
+    if (!id || !docLoaded) return
+    const before = docBucketsRef.current[id]
+    if (!before || before.rev >= revision) return
+    const conflict = () => {
+      setSaveState('conflict')
+      setSaveConflict(prev => prev ?? { canvasId: id, serverRev: revision })
+    }
+    const dirty = saveDirtyRef.current[id]
+    if (dirty?.full || dirty?.view || saveInFlightRef.current[id] || saveTimerRef.current[id]) { conflict(); return }
+    const res = await fetch(`${CANVASES_API}/${id}`, { headers: { ...getAuthHeaders() } })
+    if (!res.ok) throw new Error('画布更新读取失败')
+    const rec = await res.json()
+    if (sessionTokenRef.current !== token) return
+    const now = docBucketsRef.current[id]
+    const dirtyNow = saveDirtyRef.current[id]
+    if (saveConflictRef.current || localRestoreRef.current || dirtyNow?.full || dirtyNow?.view || saveInFlightRef.current[id] || saveTimerRef.current[id] || now?.cards !== before.cards || now?.connections !== before.connections) { conflict(); return }
+    if ((Number(rec.canvas_data?.rev) || 0) < (now?.rev || 0)) return
+    applyServerDoc(rec, id, token, { suppressSave: true })
+  }
+
   /** 冲突选择一: 加载别处已保存的最新版; 本地未同步改动先备份, 提供一次「取回我的版本」 */
   async function resolveConflictReload() {
     const conflict = saveConflictRef.current
@@ -8787,7 +8834,7 @@ export function useCanvas() {
 
   return {
     // 文档与顶栏
-    docLoaded, canvasTitle, setCanvasTitle, saveState,
+    docLoaded, canvasTitle, setCanvasTitle, saveState, prepareAgentTurn, syncAgentRevision, focusAgentNode,
     // 多标签保存冲突
     saveConflict, resolveConflictReload, resolveConflictOverwrite, flushPersistNow,
     // 崩溃本地恢复

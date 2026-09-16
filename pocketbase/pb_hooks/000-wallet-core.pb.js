@@ -443,6 +443,7 @@ routerUse(function (e) {
 
   // 需登录的业务接口（非生成类）
   var protectedAny = false
+  if (path.indexOf("/api/agent-bridge/v1/") === 0) protectedAny = true
   try {
     if (path === "/api/aigc/upload" || path === "/api/aigc/history" ||
         path === "/api/aigc/price-preview" ||
