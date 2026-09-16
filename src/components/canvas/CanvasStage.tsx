@@ -65,7 +65,8 @@ function isCardBusy(card: CanvasCardData): boolean {
 /**
  * 组外框快速拖动跟随: 拖动快速路径下卡片位置只写 DOM(不触发 React 渲染),
  * 组外框靠订阅几何版本号用 transform 跟随被拖成员, 拖动结束(成员恢复状态驱动后)自动复位为 0。
- * 只在确有组成员被快速拖动时挂 transform, 零 React 状态写入。
+ * 关键: 可见边框和组名画在外框 div(本组件的父层)上, transform 写在本组件这个透明子层上
+ * 视觉完全不可见——必须写到 parentElement(外框本身), 否则表现为拖动时卡片走了、框停在原地。
  */
 type DragDeltaReader = {
   version: number
@@ -95,11 +96,12 @@ const GroupFrameFollow = memo(function GroupFrameFollow({
       break
     }
   }
-  // 只在位移变化时写 transform: 旧实现无依赖数组, 任何舞台提交(拉线/打字)都会让所有组框重写一遍
+  // 只在位移变化时写外框 transform: 无依赖数组会让任何舞台提交(拉线/打字)都重写一遍
   useLayoutEffect(() => {
-    if (ref.current) ref.current.style.transform = `translate(${dx}px, ${dy}px)`
+    const frame = ref.current?.parentElement
+    if (frame) frame.style.transform = dx || dy ? `translate(${dx}px, ${dy}px)` : ''
   }, [dx, dy])
-  return <div ref={ref} className="pointer-events-none absolute inset-0" />
+  return <div ref={ref} className="pointer-events-none absolute inset-0" aria-hidden />
 })
 
 /**
@@ -193,14 +195,10 @@ function groupFrame(arr: CanvasCardData[], chip: { x: number; y: number; w: numb
 const ConnectionPath = memo(function ConnectionPath({
   conn,
   idx,
-  fromGroup,
-  toGroup,
   scaleBucket,
 }: {
   conn: CanvasConnection
   idx: StageIndex
-  fromGroup: { x: number; y: number; w: number; h: number } | null
-  toGroup: { x: number; y: number; w: number; h: number } | null
   /** 缩放档位(0.25/0.65/1), 只用于命中带宽度, 连续缩放不逐帧重渲染 */
   scaleBucket: number
 }) {
@@ -214,7 +212,7 @@ const ConnectionPath = memo(function ConnectionPath({
   useSyncExternalStore(
     cb => registry.subscribe(cb),
     () => {
-      // 收纳态组锚点: 组成员任一变化都影响组框, 退化为订阅全局版本(组引用线数量很少)
+      // 收纳态组锚点: 组成员任一变化都影响小卡位置, 退化为订阅全局版本(收纳组引用线数量很少)
       if (fromVersionKey[0] === 'g' || toVersionKey[0] === 'g') return registry.version
       return registry.getRectVersion(conn.fromId) * 1_000_003 + registry.getRectVersion(conn.toId)
     },
@@ -225,9 +223,33 @@ const ConnectionPath = memo(function ConnectionPath({
   // 手动判定与随后到达的原生 dblclick 都调到也只是再过滤一次, 无副作用, 故不做去重锁。
   // hook 必须在任何提前 return 之前调用, 否则端点矩形缺失首帧会触发 hooks 数量不一致崩溃。
   const lastClickRef = useRef(0)
+  /** 收纳小卡矩形: 拖动快速路径期间从注册表实测成员几何实时算, 不能用 idx 里的数据坐标(松手才更新) */
+  const liveChipRect = (gid: string) => {
+    const arr = idx.cardsByGroup.get(gid)
+    if (!arr?.length) return idx.chipRects.get(gid) ?? null
+    let left = Infinity
+    let right = -Infinity
+    let top = Infinity
+    let bottom = -Infinity
+    for (const c of arr) {
+      const r = registry.getRect(c.id)
+      if (!r) return idx.chipRects.get(gid) ?? null
+      left = Math.min(left, r.x)
+      right = Math.max(right, r.x + r.w)
+      top = Math.min(top, r.y)
+      bottom = Math.max(bottom, r.y + r.h)
+    }
+    if (left === Infinity) return idx.chipRects.get(gid) ?? null
+    return {
+      x: (left + right) / 2 - COLLAPSED_CHIP_W / 2,
+      y: (top + bottom) / 2 - COLLAPSED_CHIP_H / 2,
+      w: COLLAPSED_CHIP_W,
+      h: COLLAPSED_CHIP_H,
+    }
+  }
   const rectOf = (id: string) => {
     const card = idx.cardById.get(id)
-    if (card?.groupId && idx.collapsedGroups.has(card.groupId)) return idx.chipRects.get(card.groupId) ?? null
+    if (card?.groupId && idx.collapsedGroups.has(card.groupId)) return liveChipRect(card.groupId)
     // 实测矩形优先; 尚未测量到时回退卡片数据坐标, 保证连线层已判可见时这里绝不返回空而不画线。
     // 几何同步后版本号自增会触发重渲染, 端点随即对齐到实测值。
     const measured = registry.getRect(id)
@@ -235,9 +257,10 @@ const ConnectionPath = memo(function ConnectionPath({
     if (!card) return null
     return { x: card.x, y: card.y, w: card.w || 208, h: card.h || (card.kind === 'generate' ? 180 : 144) }
   }
-  const a = fromGroup ?? rectOf(conn.fromId)
-  // 所有连线视觉上统一进入目标卡左侧输入端口(中点); toSlot 只决定图片归属, 不影响线条显示
-  const b = toGroup ?? rectOf(conn.toId)
+  const a = rectOf(conn.fromId)
+  // 所有连线视觉上统一进入目标卡左侧输入端口(中点); toSlot 只决定图片归属, 不影响线条显示。
+  // 展开态永远锚到具体卡片端口; 只有组收纳成小卡时 rectOf 才退化为小卡矩形(多线天然汇聚)。
+  const b = rectOf(conn.toId)
   if (!a || !b) return null
   const sx = a.x + a.w
   const sy = a.y + a.h / 2
@@ -297,31 +320,6 @@ const ConnectionLayer = memo(function ConnectionLayer({
   focusIds: Set<string> | null
   scaleBucket: number
 }) {
-  // 组引用计数只随连线/卡片变化重建, 几何版本号变化(拖卡每帧)不重算
-  const pairFrom = useMemo(() => {
-    const m = new Map<string, number>()
-    connections.forEach(conn => {
-      const fg = idx.cardById.get(conn.fromId)?.groupId
-      if (fg) m.set(`${fg}>${conn.toId}`, (m.get(`${fg}>${conn.toId}`) ?? 0) + 1)
-    })
-    return m
-  }, [connections, idx])
-  const pairTo = useMemo(() => {
-    const m = new Map<string, number>()
-    connections.forEach(conn => {
-      const tg = idx.cardById.get(conn.toId)?.groupId
-      if (tg) m.set(`${conn.fromId}>${tg}`, (m.get(`${conn.fromId}>${tg}`) ?? 0) + 1)
-    })
-    return m
-  }, [connections, idx])
-  // 组锚点只与组几何(随 idx 变化)有关, 同样 memo 化, 不随拖卡版本号重算
-  const groupAnchor = useCallback((gid: string, side: 'left' | 'right') => {
-    const arr = idx.cardsByGroup.get(gid)
-    if (!arr || !arr.length) return null
-    const f = groupFrame(arr, idx.chipRects.get(gid))
-    const cy = (f.top + f.bottom) / 2
-    return side === 'right' ? { x: f.right, y: cy, w: 0, h: 0 } : { x: f.left, y: cy, w: 0, h: 0 }
-  }, [idx])
   // 连线视口剔除: 取两端包围盒的并集与视口判定相交。
   // 不能要求两个端点卡各自都在视口附近——放大后一屏只覆盖很小一片画布,
   // 长线两端可以分别落在屏幕两侧好几屏之外、线段中段却横穿视口(旧逻辑会把这种线整条剔除, 画面上线条中段消失)。
@@ -358,20 +356,7 @@ const ConnectionLayer = memo(function ConnectionLayer({
         if (focusIds && !focusIds.has(conn.fromId) && !focusIds.has(conn.toId)) return null
         // 两端包围盒并集与视口不相交才不渲染(放大后长线段中段横穿屏幕也保留)
         if (!connectionVisible(conn.fromId, conn.toId)) return null
-        const fg = idx.cardById.get(conn.fromId)?.groupId
-        const tg = idx.cardById.get(conn.toId)?.groupId
-        const fromGroup = fg && (pairFrom.get(`${fg}>${conn.toId}`) ?? 0) > 1 ? groupAnchor(fg, 'right') : null
-        const toGroup = tg && (pairTo.get(`${conn.fromId}>${tg}`) ?? 0) > 1 ? groupAnchor(tg, 'left') : null
-        return (
-          <ConnectionPath
-            key={conn.id}
-            conn={conn}
-            idx={idx}
-            fromGroup={fromGroup}
-            toGroup={toGroup}
-            scaleBucket={scaleBucket}
-          />
-        )
+        return <ConnectionPath key={conn.id} conn={conn} idx={idx} scaleBucket={scaleBucket} />
       })}
     </svg>
   )

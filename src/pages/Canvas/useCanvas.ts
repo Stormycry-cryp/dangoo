@@ -5482,18 +5482,15 @@ export function useCanvas() {
     }
     const base = selectedIds.includes(cardId) ? selectedIds : [cardId]
     const nextSel = Array.from(new Set([...base, ...members]))
-    // 按下已在多选(框选等)里的卡: 整批选中卡一起拖; 单独按下仍只移动按下的节点本身
-    // (组内可单独摆位), 整组移动走组外框; 轻点未移动时抬起选中整组
+    // 拖动范围: 多选时整批一起拖; 单选按下一张卡时, 若它在组里则整组一起拖——
+    // 否则拖动期间只有被按的那张 DOM 移动, 其余成员和组外框都留在原地, 卡片跑出框外。
+    // 轻点(未移动)抬起后选中态照旧是整组。
+    const dragIds = base.length > 1 ? nextSel : members
     const origins: Record<string, { x: number; y: number }> = {}
-    if (base.length > 1) {
-      nextSel.forEach(id => {
-        const c = cardsRef.current.find(cc => cc.id === id)
-        if (c) origins[id] = { x: c.x, y: c.y }
-      })
-    } else {
-      const pressed = cardsRef.current.find(c => c.id === cardId)
-      if (pressed) origins[pressed.id] = { x: pressed.x, y: pressed.y }
-    }
+    dragIds.forEach(id => {
+      const c = cardsRef.current.find(cc => cc.id === id)
+      if (c) origins[id] = { x: c.x, y: c.y }
+    })
     // 先不提交选中状态，避免按住节点拖动时立即弹出设置面板；抬起鼠标后再确认选中。
     // 单卡/已选多卡拖动走快速路径(move 只写 DOM, 不提交 React); 组联动拖动成员较多时也适用,
     // 只要按下的卡不是未选中状态下的组内联动(那种抬起才选中, 拖动目标明确)。
@@ -6789,7 +6786,7 @@ export function useCanvas() {
     const ownerKey = account?.email
     if (!ownerKey) return
     let active = true
-    ;(async () => {
+    const loadFirstPage = async () => {
       setAssetsLoading(true)
       assetsPageRef.current = 1
       try {
@@ -6805,9 +6802,14 @@ export function useCanvas() {
       } finally {
         if (active) setAssetsLoading(false)
       }
-    })()
+    }
+    void loadFirstPage()
+    // 「全部产物」分区批量存入素材库后广播刷新, 切回素材库分区立即看到新存项
+    const onAssetsChanged = () => { void loadFirstPage() }
+    window.addEventListener('dangoo:assets-changed', onAssetsChanged)
     return () => {
       active = false
+      window.removeEventListener('dangoo:assets-changed', onAssetsChanged)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account?.email])

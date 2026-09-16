@@ -1,4 +1,4 @@
-import { Images, Loader2, PanelRightClose, Save, Workflow } from 'lucide-react'
+import { Images, Loader2, Save, Workflow } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { useCanvas } from '@/pages/Canvas/useCanvas'
 
@@ -53,14 +53,6 @@ export function AssetLibraryHeader({
         >
           {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
           {saveLabel}
-        </button>
-        <button
-          type="button"
-          title="收起资产库"
-          onClick={() => p.setAssetPanelOpen(false)}
-          className="rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-        >
-          <PanelRightClose className="h-4 w-4" />
         </button>
       </div>
 
