@@ -4,7 +4,9 @@ function clone<T>(value:T):T { return JSON.parse(JSON.stringify(value)); }
 const kinds=['prompt','generate','polish','result','video','layer','replicate','agent','loop','merge','tts','motion','vsr','camera'];
 export const NODE_CATALOG:NodeCapability[]=kinds.map(kind=>({kind,name:kind,description:`Dangoo ${kind} 节点；执行能力以服务端握手为准`,runnable:false,parameters:{type:'object',properties:{title:{type:'string',maxLength:160},prompt:{type:'string',maxLength:24000},model:{type:'string',maxLength:120},width:{type:'number',minimum:64,maximum:4096},height:{type:'number',minimum:64,maximum:4096}},additionalProperties:false}}));
 export const SUPPORTED_OPERATIONS:CanvasOperation['type'][]=['create','update','delete','duplicate','connect','disconnect','layout','group','ungroup'];
-const writable=new Set(['title','prompt','model','width','height']);
+export const GENERATION_PARAMETERS={type:'object',properties:{model:{type:'string',maxLength:120},resolution:{enum:['1k','2k','4k']},aspectRatio:{type:'string',maxLength:16},quality:{enum:['low','medium','high']},count:{const:1}},additionalProperties:false};
+for(const node of NODE_CATALOG)if(node.kind==='generate')(node.parameters.properties as Record<string,unknown>).genParams=GENERATION_PARAMETERS;
+const writable=new Set(['title','prompt','model','width','height','genParams']);
 const invalid=(message:string):never=>{throw new IntegrationError('INVALID_OPERATION',message);};
 const finite=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&Math.abs(n)<=1_000_000;
 const id=(s:unknown)=>typeof s==='string'&&/^[\w.-]{1,128}$/.test(s);
@@ -20,6 +22,16 @@ export function applyCanvasOperations(source:CanvasSnapshot, changes:CanvasOpera
       if(!writable.has(key)) invalid(`不允许写入字段: ${key}`);
       if(['title','prompt','model'].includes(key)&&(typeof v!=='string'||v.length>(key==='prompt'?24000:160))) invalid('文本字段不合法');
       if(['width','height'].includes(key)&&(!finite(v)||Number(v)<64||Number(v)>4096)) invalid('尺寸不合法');
+      if(key==='genParams'){
+        if(!v||typeof v!=='object'||Array.isArray(v))invalid('生成参数必须为对象');
+        for(const [name,value] of Object.entries(v as Record<string,unknown>)){
+          if(!Object.prototype.hasOwnProperty.call(GENERATION_PARAMETERS.properties,name))invalid('不支持的生成参数');
+          if(name==='count'){if(value!==1)invalid('当前只支持单张生成');}
+          else if(typeof value!=='string'||value.length>120)invalid('生成参数格式错误');
+          if(name==='resolution'&&!['1k','2k','4k'].includes(String(value)))invalid('分辨率不支持');
+          if(name==='quality'&&!['low','medium','high'].includes(String(value)))invalid('质量不支持');
+        }
+      }
     }
     return clone(value);
   };

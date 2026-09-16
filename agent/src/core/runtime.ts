@@ -105,6 +105,7 @@ export interface AgentRuntimeOptions {
   beforeToolExecute?: import('./tool-scheduler.js').ToolSchedulerOptions['beforeExecute'];
   afterToolExecute?: import('./tool-scheduler.js').ToolSchedulerOptions['afterExecute'];
   allowExternalWithoutPolicy?: boolean;
+  onApprovalReply?: (run: Run, wait: WaitRequest, decision: 'approve' | 'deny') => Promise<void>;
 }
 
 export interface SessionState {
@@ -187,6 +188,8 @@ export class AgentRuntime {
   private readonly beforeToolExecute?: import('./tool-scheduler.js').ToolSchedulerOptions['beforeExecute'];
   private readonly afterToolExecute?: import('./tool-scheduler.js').ToolSchedulerOptions['afterExecute'];
   private readonly allowExternalWithoutPolicy: boolean;
+  private readonly onApprovalReply?: AgentRuntimeOptions['onApprovalReply'];
+  private pollingJobs = false;
   private readonly parallelism: number;
 
   private readonly systemPrompt: string;
@@ -210,6 +213,7 @@ export class AgentRuntime {
     this.assets = options.assets;
     this.limits = { ...DEFAULT_RUNTIME_LIMITS, ...(options.limits ?? {}) };
     this.beforeToolExecute = options.beforeToolExecute;
+    this.onApprovalReply = options.onApprovalReply;
     this.afterToolExecute = options.afterToolExecute;
     this.allowExternalWithoutPolicy = options.allowExternalWithoutPolicy ?? false;
     this.parallelism = Math.max(1, Math.min(64, Math.floor(options.parallelism ?? 4)));
@@ -365,6 +369,36 @@ export class AgentRuntime {
     });
   }
 
+  async pollJobs(): Promise<void> {
+    if (this.pollingJobs || !this.canvas?.job) return;
+    this.pollingJobs = true;
+    try {
+      for (const saved of this.store.listJobs().filter(job => ['created', 'submitting', 'submitted', 'running', 'submission_unknown'].includes(job.state) || (job.state === 'succeeded' && job.storageState !== 'stored'))) {
+        try {
+          const session = this.getSession(saved.sessionId);
+          const job = await this.canvas.job(session.scope, saved.id);
+          this.store.saveJob({ ...saved, ...job });
+          this.publish(session.id, { runId: saved.runId, type: 'job.updated', data: { job } });
+          if (job.applyState === 'applied' && saved.applyState !== 'applied') {
+            const canvas = await this.canvas.read(session.scope);
+            this.publish(session.id, { runId: saved.runId, type: 'canvas.changed', data: { canvasId: session.scope.canvasId, revision: canvas.revision } });
+          }
+          const run = saved.runId ? this.store.getRun(saved.runId) : undefined;
+          if (run?.state === 'waiting_jobs') {
+            const outstanding = this.store.listJobs({ runId: run.id, activeOnly: true });
+            if (!outstanding.length) {
+              const jobs = this.store.listJobs({ runId: run.id });
+              if (jobs.every(item => item.state !== 'succeeded' || item.storageState === 'stored')) {
+                this.store.appendMessage({ id: randomUUID(), sessionId: session.id, runId: run.id, role: 'system', content: [{ type: 'text', text: `节点任务最新状态：${JSON.stringify(jobs.map(item => ({ id: item.id, nodeId: item.nodeId, state: item.state, storageState: item.storageState, applyState: item.applyState })))}` }] });
+                await this.resumeRun(run.id);
+              }
+            }
+          }
+        } catch { /* A transient business outage leaves the durable job available for the next poll. */ }
+      }
+    } finally { this.pollingJobs = false; }
+  }
+
   async reply(runId: string, input: { text: string; waitId: string; decision?: 'approve' | 'deny' }): Promise<Run> {
     this.validateText(input.text);
     if (!input.waitId || input.waitId.length > 256) throw new Error('waitId is required');
@@ -385,6 +419,10 @@ export class AgentRuntime {
       const decision = run.wait.kind === 'approval' ? (input.decision ?? this.approvalDecision(input.text)) : undefined;
       if (run.wait.kind === 'approval' && decision === undefined) {
         throw new Error('approval wait requires decision=approve or decision=deny');
+      }
+      if (run.wait.kind === 'approval' && decision) {
+        const trusted = this.store.listOperations({ runId: run.id }).some(operation => operation.toolName !== 'ask_user' && operation.result?.wait?.id === run.wait!.id);
+        if (trusted) await this.onApprovalReply?.(run, run.wait, decision);
       }
       if (run.wait.kind === 'approval' && decision === 'deny' && pending.length > 0) {
         await this.deferPendingCalls(run, pending, input.text);

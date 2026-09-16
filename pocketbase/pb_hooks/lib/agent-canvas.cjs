@@ -74,7 +74,9 @@ function clone(value) {
 var kinds = ["prompt", "generate", "polish", "result", "video", "layer", "replicate", "agent", "loop", "merge", "tts", "motion", "vsr", "camera"];
 var NODE_CATALOG = kinds.map((kind) => ({ kind, name: kind, description: `Dangoo ${kind} \u8282\u70B9\uFF1B\u6267\u884C\u80FD\u529B\u4EE5\u670D\u52A1\u7AEF\u63E1\u624B\u4E3A\u51C6`, runnable: false, parameters: { type: "object", properties: { title: { type: "string", maxLength: 160 }, prompt: { type: "string", maxLength: 24e3 }, model: { type: "string", maxLength: 120 }, width: { type: "number", minimum: 64, maximum: 4096 }, height: { type: "number", minimum: 64, maximum: 4096 } }, additionalProperties: false } }));
 var SUPPORTED_OPERATIONS = ["create", "update", "delete", "duplicate", "connect", "disconnect", "layout", "group", "ungroup"];
-var writable = /* @__PURE__ */ new Set(["title", "prompt", "model", "width", "height"]);
+var GENERATION_PARAMETERS = { type: "object", properties: { model: { type: "string", maxLength: 120 }, resolution: { enum: ["1k", "2k", "4k"] }, aspectRatio: { type: "string", maxLength: 16 }, quality: { enum: ["low", "medium", "high"] }, count: { const: 1 } }, additionalProperties: false };
+for (const node of NODE_CATALOG) if (node.kind === "generate") node.parameters.properties.genParams = GENERATION_PARAMETERS;
+var writable = /* @__PURE__ */ new Set(["title", "prompt", "model", "width", "height", "genParams"]);
 var invalid = (message) => {
   throw new IntegrationError("INVALID_OPERATION", message);
 };
@@ -93,6 +95,17 @@ function applyCanvasOperations(source, changes) {
       if (!writable.has(key)) invalid(`\u4E0D\u5141\u8BB8\u5199\u5165\u5B57\u6BB5: ${key}`);
       if (["title", "prompt", "model"].includes(key) && (typeof v !== "string" || v.length > (key === "prompt" ? 24e3 : 160))) invalid("\u6587\u672C\u5B57\u6BB5\u4E0D\u5408\u6CD5");
       if (["width", "height"].includes(key) && (!finite(v) || Number(v) < 64 || Number(v) > 4096)) invalid("\u5C3A\u5BF8\u4E0D\u5408\u6CD5");
+      if (key === "genParams") {
+        if (!v || typeof v !== "object" || Array.isArray(v)) invalid("\u751F\u6210\u53C2\u6570\u5FC5\u987B\u4E3A\u5BF9\u8C61");
+        for (const [name, value2] of Object.entries(v)) {
+          if (!Object.prototype.hasOwnProperty.call(GENERATION_PARAMETERS.properties, name)) invalid("\u4E0D\u652F\u6301\u7684\u751F\u6210\u53C2\u6570");
+          if (name === "count") {
+            if (value2 !== 1) invalid("\u5F53\u524D\u53EA\u652F\u6301\u5355\u5F20\u751F\u6210");
+          } else if (typeof value2 !== "string" || value2.length > 120) invalid("\u751F\u6210\u53C2\u6570\u683C\u5F0F\u9519\u8BEF");
+          if (name === "resolution" && !["1k", "2k", "4k"].includes(String(value2))) invalid("\u5206\u8FA8\u7387\u4E0D\u652F\u6301");
+          if (name === "quality" && !["low", "medium", "high"].includes(String(value2))) invalid("\u8D28\u91CF\u4E0D\u652F\u6301");
+        }
+      }
     }
     return clone(value);
   };

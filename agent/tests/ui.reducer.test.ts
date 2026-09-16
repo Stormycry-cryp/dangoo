@@ -88,6 +88,16 @@ test('hidden reasoning events never enter the visible event log', () => {
   assert.equal(state.messages.length, 0);
 });
 
+test('loading another canvas session cannot import its messages', async () => {
+  const client = { getSession: async () => ({ session: { id: 'foreign', scope: { canvasId: 'other' } }, messages: [{ id: 'secret', role: 'user', content: [{ type: 'text', text: 'other canvas' }] }] }) } as unknown as AgentClientLike;
+  const store = createAgentStore({ client, canvasId: 'current', hostBridge: { contractVersion: '1.0.0', canvasId: 'current', getSelection: () => ({ nodeIds: [], assets: [] }), locateNode() {}, previewAsset() {} } });
+  await store.loadSession('foreign');
+  assert.equal(store.getState().session, undefined);
+  assert.equal(store.getState().messages.length, 0);
+  assert.equal(store.getState().error, '会话不属于当前画布');
+  store.destroy();
+});
+
 test('tool and job lifecycle states remain visible as compact cards', () => {
   let state = applyAgentEvent(baseState, event(1, 'tool.call.received', { toolCallId: 'tool-1', name: 'asset_view', label: '查看参考图', target: '产品原图' }));
   state = applyAgentEvent(state, event(2, 'tool.completed', { toolCallId: 'tool-1', name: 'asset_view', durationMs: 184 }));

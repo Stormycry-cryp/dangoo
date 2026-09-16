@@ -1,7 +1,11 @@
 /// <reference path="../pb_data/types.d.ts" />
+routerAdd("POST", "/api/agent-bridge/v1/wallet-quote", function (e) {
+  return e.json(503, { error: "WALLET_PRICING_UNAVAILABLE" })
+})
 // Business bridge only. Agent runtime, providers and UI live in the separate dangoo-agent project.
 onBootstrap(function (e) {
   e.next()
+  require(__hooks + "/lib/agent-jobs.cjs").bootstrap()
   try { $app.findCollectionByNameOrId("agent_canvas_operations"); return } catch (_) {}
   $app.save(new Collection({
     type: "base", name: "agent_canvas_operations",
@@ -21,9 +25,18 @@ onBootstrap(function (e) {
 routerAdd("GET", "/api/agent-bridge/v1/capabilities", function (e) {
   if (!e.get("authEmail")) return e.json(401, { error: "AUTH_REQUIRED" })
   var api = require(__hooks + "/lib/agent-canvas.cjs")
-  return e.json(200, { contractVersion: "1.0.0", revision: "dangoo-bridge-1", nodes: api.NODE_CATALOG,
-    operations: api.SUPPORTED_OPERATIONS, jobs: false, assets: false })
+  var jobs = require(__hooks + "/lib/agent-jobs.cjs").enabled()
+  return e.json(200, { contractVersion: "1.0.0", revision: "dangoo-bridge-2", nodes: api.NODE_CATALOG.map(function(n) { return Object.assign({}, n, { runnable: jobs && n.kind === "generate" }) }),
+    operations: api.SUPPORTED_OPERATIONS, jobs: jobs, assets: false })
 })
+
+routerAdd("POST", "/api/agent-bridge/v1/canvases/{id}/quotes", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "quote") })
+routerAdd("GET", "/api/agent-bridge/v1/canvases/{id}/image-models", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "models") })
+routerAdd("GET", "/api/agent-bridge/v1/canvases/{id}/quotes/{jobId}", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "quote_get") })
+routerAdd("POST", "/api/agent-bridge/v1/canvases/{id}/quotes/{jobId}/approve", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "approve") })
+routerAdd("POST", "/api/agent-bridge/v1/canvases/{id}/jobs", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "run") })
+routerAdd("GET", "/api/agent-bridge/v1/canvases/{id}/jobs/{jobId}", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "get") })
+routerAdd("GET", "/api/agent-bridge/v1/canvases/{id}/job-operations/{operationId}", function(e) { return require(__hooks + "/lib/agent-jobs.cjs").handle(e, "operation") })
 
 routerAdd("GET", "/api/agent-bridge/v1/canvases/{id}", function (e) {
   var owner = String(e.get("authEmail") || "").trim().toLowerCase()

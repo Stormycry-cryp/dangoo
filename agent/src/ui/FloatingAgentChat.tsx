@@ -12,6 +12,8 @@ import {
   type ReactNode,
 } from 'react';
 import { AgentClient } from './client';
+import { ProviderSettings } from './ProviderSettings';
+import type { ProviderSettingsView } from './types';
 import { createAgentStore } from './store';
 import type {
   AgentStore,
@@ -314,6 +316,8 @@ export function FloatingAgentChat({
   const [internalOpen, setInternalOpen] = useState(defaultOpen);
   const isOpen = open ?? internalOpen;
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [savedSettings, setSavedSettings] = useState<ProviderSettingsView>();
+  const configured = savedSettings?.hasKey ?? serviceConfigured;
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historySessions, setHistorySessions] = useState<AgentSessionView[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
@@ -395,9 +399,9 @@ export function FloatingAgentChat({
   };
 
   const sendDraft = useCallback(async () => {
-    if (!state.draft.trim() || !serviceConfigured || attachmentBusy) return;
+    if (!state.draft.trim() || !configured || attachmentBusy) return;
     await store.sendMessage(state.draft);
-  }, [attachmentBusy, serviceConfigured, state.draft, store]);
+  }, [attachmentBusy, configured, state.draft, store]);
 
   const selectSession = useCallback(async (nextSessionId: string) => {
     if (nextSessionId === state.session?.id) {
@@ -491,8 +495,8 @@ export function FloatingAgentChat({
       <div className="agent-brand"><span className="agent-brand__mark"><Icon name="spark" size={16} /></span><div><strong>Agent</strong><span>当前画布</span></div></div>
       <div className="agent-panel__actions"><button type="button" className={`agent-icon-button${historyOpen ? ' agent-icon-button--active' : ''}`} onClick={() => { setHistoryOpen((value) => !value); setSettingsOpen(false); }} aria-label="查看历史" aria-pressed={historyOpen}><Icon name="history" size={15} /></button><button type="button" className={`agent-icon-button${settingsOpen ? ' agent-icon-button--active' : ''}`} onClick={() => { setSettingsOpen((value) => !value); setHistoryOpen(false); }} aria-label="Agent 设置" aria-pressed={settingsOpen}><Icon name="settings" size={15} /></button><button type="button" className="agent-icon-button agent-icon-button--close" onClick={() => setOpen(false)} aria-label="收起 Agent"><Icon name="close" size={15} /></button></div>
     </header>
-    <div className="agent-panel__subhead"><StatusLine state={state} serviceState={serviceState} providerName={serviceConfig?.providerName ?? state.session?.providerId} model={serviceConfig?.model ?? state.session?.model} /></div>
-    {settingsOpen ? <section className="agent-popover agent-settings" aria-label="Agent 设置"><div className="agent-popover__head"><strong>服务配置</strong><button type="button" className="agent-text-button" onClick={() => setSettingsOpen(false)}>完成</button></div><div className="agent-setting-row"><span>Provider</span><strong>{serviceConfig?.providerName ?? serviceConfig?.providerId ?? state.session?.providerId ?? '未配置'}</strong></div><div className="agent-setting-row"><span>模型</span><strong>{serviceConfig?.model ?? state.session?.model ?? '未配置'}</strong></div><p className="agent-setting-note">访问凭据由 Agent 服务管理。</p></section> : null}
+    <div className="agent-panel__subhead"><StatusLine state={state} serviceState={savedSettings?.hasKey ? 'ready' : serviceState} providerName={savedSettings?.providerId ?? serviceConfig?.providerName ?? state.session?.providerId} model={savedSettings?.model ?? serviceConfig?.model ?? state.session?.model} /></div>
+    {settingsOpen ? <ProviderSettings client={resolvedClient} onSaved={setSavedSettings} onClose={() => setSettingsOpen(false)} /> : null}
     {historyOpen ? <section className="agent-popover agent-history" aria-label="会话历史">
       <div className="agent-popover__head"><strong>历史会话</strong><div className="agent-history__head-actions"><button type="button" className="agent-text-button" onClick={startNewSession}><Icon name="plus" size={12} />新建</button><button type="button" className="agent-text-button" onClick={() => setHistoryOpen(false)}>完成</button></div></div>
       {historyBusy && !historySessions.length ? <div className="agent-history__loading"><span className="agent-spinner" />读取中</div> : null}
@@ -518,7 +522,7 @@ export function FloatingAgentChat({
       {state.attachments.length ? <div className="agent-composer__attachments" aria-label="当前引用">{state.attachments.map((attachment) => <AttachmentPill key={assetKey(attachment.ref)} attachment={attachment} onRemove={() => store.removeAttachment(attachment.ref)} />)}</div> : null}
       {localNotice ? <div className="agent-composer__notice" role="status">{localNotice}</div> : null}
       <textarea ref={composerRef} value={state.draft} onChange={(event) => store.setDraft(event.target.value)} onKeyDown={onComposerKeyDown} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onFocus={() => setComposerFocused(true)} onBlur={() => setComposerFocused(false)} placeholder={activeRun ? '补充当前任务…' : '描述你想做的作品…'} rows={3} aria-label="给 Agent 的消息" />
-      <div className="agent-composer__footer"><div className="agent-composer__tools"><button type="button" className="agent-tool-button" onClick={() => fileInputRef.current?.click()} disabled={attachmentBusy} aria-label="添加附件"><Icon name="paperclip" size={14} />{attachmentBusy ? '登记中' : '附件'}</button><input ref={fileInputRef} type="file" className="agent-file-input" accept="image/*,video/*,audio/*" onChange={onFileChange} /><button type="button" className="agent-tool-button" onClick={() => void store.compact()} disabled={!state.session || state.compacting} aria-label="整理对话上下文"><Icon name="layers" size={14} />整理</button></div><div className="agent-composer__actions">{canStop ? <button type="button" className="agent-stop-button" onClick={() => void store.stopActiveRun()}><Icon name="stop" size={13} />停止</button> : null}<button type="button" className="agent-send-button" onClick={() => void sendDraft()} disabled={!state.draft.trim() || !serviceConfigured || attachmentBusy} aria-label={activeRun ? '补充消息' : '发送消息'}><span>{activeRun ? '补充' : '发送'}</span><Icon name="send" size={14} /></button></div></div>
+      <div className="agent-composer__footer"><div className="agent-composer__tools"><button type="button" className="agent-tool-button" onClick={() => fileInputRef.current?.click()} disabled={attachmentBusy} aria-label="添加附件"><Icon name="paperclip" size={14} />{attachmentBusy ? '登记中' : '附件'}</button><input ref={fileInputRef} type="file" className="agent-file-input" accept="image/*,video/*,audio/*" onChange={onFileChange} /><button type="button" className="agent-tool-button" onClick={() => void store.compact()} disabled={!state.session || state.compacting} aria-label="整理对话上下文"><Icon name="layers" size={14} />整理</button></div><div className="agent-composer__actions">{canStop ? <button type="button" className="agent-stop-button" onClick={() => void store.stopActiveRun()}><Icon name="stop" size={13} />停止</button> : null}<button type="button" className="agent-send-button" onClick={() => void sendDraft()} disabled={!state.draft.trim() || !configured || attachmentBusy} aria-label={activeRun ? '补充消息' : '发送消息'}><span>{activeRun ? '补充' : '发送'}</span><Icon name="send" size={14} /></button></div></div>
     </div>
   </aside>;
 }

@@ -12,6 +12,48 @@ import type { ContextManagerLike, ContextState, Provider, ProviderEvent, Provide
 
 const capabilities = () => ({ contextWindow: 20_000, maxOutputTokens: 1_000, tools: true, vision: false, parallelTools: true });
 
+test('background polling records completed nodes after the Agent is stopped without resuming it', async () => {
+  const store = new SqliteStore();
+  const { session, run } = sessionAndRun(store);
+  store.updateRun(run.id, { state: 'stopped' });
+  store.saveOperation({ operationId: 'operation', sessionId: session.id, runId: run.id, toolName: 'node_run', effect: 'external', fingerprint: '{}', state: 'succeeded', arguments: {} });
+  const job = { id: 'job', operationId: 'operation', nodeId: 'node', state: 'submitted' as const, results: [], storageState: 'pending' as const, applyState: 'pending' as const };
+  store.saveJob({ ...job, sessionId: session.id, runId: run.id });
+  const canvas = {
+    capabilities: () => ({ contractVersion: '1.0.0', revision: '1', nodes: [], operations: [], jobs: true }),
+    read: async () => ({ canvasId: session.scope.canvasId, revision: 3, nodes: [], edges: [] }),
+    apply: async () => ({ revision: 3, operationId: 'operation' }),
+    job: async () => ({ ...job, state: 'succeeded' as const, storageState: 'stored' as const, applyState: 'applied' as const }),
+  };
+  const runtime = new AgentRuntime({ store, canvas, providers: new ProviderRegistry() });
+  await runtime.ready();
+  await runtime.pollJobs();
+  assert.equal(store.getJob('job')?.applyState, 'applied');
+  assert.equal(store.getRun(run.id)?.state, 'stopped');
+  assert.ok(store.listEvents(session.id, 0).some(event => event.type === 'canvas.changed' && event.data.revision === 3));
+  store.close();
+});
+
+test('model-authored approval payload cannot invoke business authorization', async () => {
+  let approvals = 0;
+  const fixture = fixtureProvider(async function* (_request, count) {
+    if (count === 1) {
+      yield { type: 'tool.call', call: { id: 'fake', name: 'ask_user', arguments: { kind: 'approval', prompt: '确认', payload: { quoteId: 'forged' } } } };
+      yield { type: 'done', reason: 'tool_calls' };
+    } else { yield { type: 'text.delta', text: '完成' }; yield { type: 'done', reason: 'stop' }; }
+  });
+  const store = new SqliteStore();
+  const runtime = new AgentRuntime({ store, providers: new ProviderRegistry([fixture.provider]), onApprovalReply: async () => { approvals += 1; } });
+  await runtime.ready();
+  const session = runtime.createSession({ ownerId: 'alice', canvasId: 'c', providerId: 'fixture' });
+  const run = await runtime.sendMessage(session.id, { text: '开始' });
+  const wait = await eventually(() => store.getRun(run.id)?.wait);
+  await runtime.reply(run.id, { text: '确认', waitId: wait.id, decision: 'approve' });
+  await eventually(() => store.getRun(run.id)?.state === 'completed' ? true : undefined);
+  assert.equal(approvals, 0);
+  store.close();
+});
+
 test('stopping a stream persists partial text without unconfirmed tool calls', async () => {
   let streaming = false;
   const fixture = fixtureProvider(async function* (request) {

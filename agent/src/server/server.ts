@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { timingSafeEqual } from 'node:crypto';
 import type { AgentEvent, CanvasGateway } from '../contracts/index.js';
 import { AgentRuntime } from '../core/runtime.js';
+import type { ProviderSettingsManager } from './provider-settings.js';
 
 export interface AgentPrincipal {
   ownerId: string;
@@ -25,6 +26,7 @@ export interface AgentServerOptions {
   heartbeatMs?: number;
   configured?: boolean | (() => boolean);
   canvas?: CanvasGateway;
+  providerSettings?: ProviderSettingsManager;
 }
 
 class HttpError extends Error {
@@ -206,6 +208,18 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
     }
 
     const principal = authenticate(req);
+    if (path[0] === 'settings' && path[1] === 'provider' && path.length <= 3) {
+      if (principal.ownerId !== defaultPrincipal.ownerId || !options.providerSettings) throw new HttpError(403, '无权管理服务配置', 'forbidden');
+      try {
+        const settings = options.providerSettings;
+        if (req.method === 'GET' && path.length === 2) { writeJson(res, 200, settings.read(), origin); return; }
+        if (req.method === 'POST') {
+          const input = await readJson(req, 16384);
+          if (path[2] === 'test') { writeJson(res, 200, await settings.test(input), origin); return; }
+          if (path.length === 2) { writeJson(res, 200, settings.save(input), origin); return; }
+        }
+      } catch (error) { throw new HttpError(400, error instanceof Error ? error.message : '配置操作失败'); }
+    }
     if (req.method === 'GET' && path.length === 1 && path[0] === 'capabilities') {
       writeJson(res, 200, runtime.capabilities(), origin);
       return;
@@ -218,15 +232,18 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
     }
 
     if (path.length === 1 && path[0] === 'sessions' && req.method === 'GET') {
-      writeJson(res, 200, { sessions: runtime.listSessions({ ownerId: principal.ownerId }) }, origin);
+      const canvasId = parsed.searchParams.get('canvasId');
+      if (canvasId) allowCanvas(principal, canvasId);
+      writeJson(res, 200, { sessions: runtime.listSessions({ ownerId: principal.ownerId }).filter(session => (!canvasId || session.scope.canvasId === canvasId) && (!principal.canvasIds || principal.canvasIds.includes(session.scope.canvasId))) }, origin);
       return;
     }
     if (path.length === 1 && path[0] === 'sessions' && req.method === 'POST') {
       const body = await readJson(req, maxBodyBytes);
       const canvasId = asString(body.canvasId, 'canvasId');
       allowCanvas(principal, canvasId);
-      const providerId = body.providerId === undefined ? undefined : asString(body.providerId, 'providerId', 160);
-      const model = body.model === undefined ? undefined : asString(body.model, 'model', 256);
+      const defaults = options.providerSettings?.read();
+      const providerId = body.providerId === undefined ? defaults?.providerId : asString(body.providerId, 'providerId', 160);
+      const model = body.model === undefined ? defaults?.model : asString(body.model, 'model', 256);
       const session = runtime.createSession({ ownerId: principal.ownerId, canvasId, providerId, model });
       writeJson(res, 201, { session }, origin);
       return;
@@ -272,6 +289,8 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
       if (path.length === 3 && path[2] === 'messages' && req.method === 'POST') {
         if (!configuredNow()) throw new HttpError(503, 'Agent provider is not configured', 'provider_not_configured');
         const body = await readJson(req, maxBodyBytes);
+        const settings = options.providerSettings?.read();
+        if (settings && !runtime.store.getActiveRun(session.id)) runtime.store.setSessionProvider(session.id, settings.providerId, settings.model);
         const text = asString(body.text, 'text', maxTextLength);
         let selection = body.selection;
         if (selection !== undefined && (typeof selection !== 'object' || selection === null || Array.isArray(selection))) throw new HttpError(400, 'selection must be an object', 'invalid_input');

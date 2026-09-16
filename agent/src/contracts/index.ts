@@ -57,13 +57,19 @@ export type CanvasOperation =
  | {type:'group';id:string;nodeIds:string[]} | {type:'ungroup';id:string};
 export interface NodeCapability {kind:string;name:string;description:string;parameters:JsonSchema;runnable:boolean;}
 export interface JobRecord {id:string;operationId:string;nodeId:string;state:'created'|'submitting'|'submitted'|'running'|'succeeded'|'failed'|'canceled'|'submission_unknown';remoteId?:string;results:AssetRef[];storageState:'pending'|'stored'|'failed';applyState:'pending'|'applied'|'conflict'|'target_missing';error?:string;}
+export interface NodeQuote {id:string;nodeId:string;expectedRevision:number;model:string;prompt:string;referenceCount:number;price:Record<string,unknown>;expiresAt:number;approved:boolean;}
 export interface CanvasGateway {
   capabilities():{contractVersion:string;revision:string;nodes:NodeCapability[];operations:CanvasOperation['type'][];jobs:boolean};
   read(scope:Scope):Promise<CanvasSnapshot>;
   apply(scope:Scope,input:{expectedRevision:number;operationId:string;operations:CanvasOperation[]}):Promise<{revision:number;operationId:string}>;
   operation?(scope:Scope,id:string):Promise<{revision:number;operationId:string}|undefined>;
-  run?(scope:Scope,input:{nodeId:string;operationId:string;expectedRevision:number}):Promise<JobRecord>;
+  quote?(scope:Scope,input:{nodeId:string;expectedRevision:number}):Promise<NodeQuote>;
+  imageModels?(scope:Scope):Promise<unknown>;
+  getQuote?(scope:Scope,id:string):Promise<NodeQuote>;
+  approveQuote?(scope:Scope,id:string):Promise<NodeQuote>;
+  run?(scope:Scope,input:{nodeId:string;operationId:string;expectedRevision:number;quoteId?:string}):Promise<JobRecord>;
   job?(scope:Scope,id:string):Promise<JobRecord>;
+  jobOperation?(scope:Scope,id:string):Promise<JobRecord|undefined>;
   cancel?(scope:Scope,id:string):Promise<JobRecord>;
 }
 export interface HostBridge {contractVersion:string;canvasId:string;getSelection():Selection;beforeSend?():Promise<void>;locateNode(id:string):void;previewAsset(ref:AssetRef):void;onCanvasChanged?(revision:number):void;}

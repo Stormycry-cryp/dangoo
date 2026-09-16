@@ -672,6 +672,7 @@ export class OpenAICompatibleProvider implements Provider {
     try {
       response = await this.fetcher(this.requestUrl(), {
         method: 'POST',
+        redirect: 'error',
         headers,
         body: safeJson(payload),
         signal: request.signal,

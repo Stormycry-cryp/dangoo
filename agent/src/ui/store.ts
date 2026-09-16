@@ -605,6 +605,10 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
         dispatch({ type: 'error.changed', error: '会话响应缺少会话 ID' });
         return;
       }
+      if (snapshot.session.canvasId !== options.canvasId) {
+        dispatch({ type: 'error.changed', error: '会话不属于当前画布' });
+        return;
+      }
       // Replay the snapshot events to rebuild derived tool/run/job state. The event list
       // itself is also rebuilt by the reducer, so each event appears exactly once.
       dispatch({ type: 'session.loaded', session: snapshot.session, messages: snapshot.messages, sequence: 0 });

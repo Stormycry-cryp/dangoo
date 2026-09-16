@@ -1,10 +1,11 @@
 import type { AssetGateway, AssetRef, AssetSearch, CanvasGateway, CanvasOperation, ToolContext, ToolDefinition, ToolResult } from '../contracts/index.js';
 import { IntegrationError } from './assets.js';
+import { GENERATION_PARAMETERS } from './canvas-operations.js';
 const refSchema={type:'object',properties:{assetId:{type:'string',minLength:1,maxLength:128},version:{type:'integer',minimum:1},role:{enum:['reference','edit_source','result']}},required:['assetId','version'],additionalProperties:false};
 const string={type:'string',minLength:1,maxLength:128};
 const object=(properties:Record<string,unknown>,required:string[]=[])=>({type:'object',properties,required,additionalProperties:false});
 const coordinate={type:'number',minimum:-1000000,maximum:1000000};
-const nodeData=object({title:{type:'string',maxLength:160},prompt:{type:'string',maxLength:24000},model:{type:'string',maxLength:120},width:{type:'number',minimum:64,maximum:4096},height:{type:'number',minimum:64,maximum:4096}});
+const nodeData=object({title:{type:'string',maxLength:160},prompt:{type:'string',maxLength:24000},model:{type:'string',maxLength:120},genParams:GENERATION_PARAMETERS,width:{type:'number',minimum:64,maximum:4096},height:{type:'number',minimum:64,maximum:4096}});
 const nodeSchema=object({id:string,kind:{enum:['prompt','generate','polish','result','video','layer','replicate','agent','loop','merge','tts','motion','vsr','camera']},x:coordinate,y:coordinate,data:nodeData},['id','kind','x','y','data']);
 const operationSchemas:Record<string,Record<string,unknown>>={
   create:object({type:{const:'create'},node:nodeSchema},['type','node']),
@@ -46,10 +47,19 @@ export function createCanvasTools(canvas:CanvasGateway,assets:AssetGateway):Tool
     }),
   ];
   if(caps.jobs&&canvas.run&&canvas.job){
-    tools.push(tool('node_run','提交已有节点到业务生成服务。须已有费用授权；返回 submitted 不表示生成完成。',object({nodeId:string,expectedRevision:{type:'integer',minimum:0}},['nodeId','expectedRevision']),'external',async(a,c)=>{
-      const job=await canvas.run!(c.session.scope,{...a as {nodeId:string;expectedRevision:number},operationId:c.operationId});c.emit('job.updated',{job});return result(job);
+    if(canvas.imageModels)tools.push(tool('node_image_models','查询宿主图片模型及参数目录；genParams.model 使用模型家族，连入图片后自动选图生图渠道。',object({}),'read',async(_a,c)=>result(await canvas.imageModels!(c.session.scope))));
+    if(canvas.quote)tools.push(tool('node_quote','固定标准图片节点及相连提示词、参考图的执行参数并查询费用。报价需要用户确认后才能生成。',object({nodeId:string,expectedRevision:{type:'integer',minimum:0}},['nodeId','expectedRevision']),'read',async(a,c)=>result(await canvas.quote!(c.session.scope,a as {nodeId:string;expectedRevision:number}))));
+    tools.push(tool('node_run','提交已有图片节点。quoteId 来自 node_quote。若当前对话中用户已明确预先授权本次扣费，按语义判断范围与后续撤销，authorization 填该用户消息原文片段；普通创作指令不自动等于费用授权。无授权则服务暂停向用户确认。',object({nodeId:string,expectedRevision:{type:'integer',minimum:0},quoteId:string,authorization:object({userText:{type:'string',minLength:1,maxLength:4000}},['userText'])},['nodeId','expectedRevision','quoteId']),'external',async(a,c)=>{
+      const input=a as {nodeId:string;expectedRevision:number;quoteId:string};
+      const quote=await canvas.getQuote?.(c.session.scope,input.quoteId);
+      if(!quote||quote.nodeId!==input.nodeId||quote.expectedRevision!==input.expectedRevision)throw new IntegrationError('QUOTE_MISMATCH','报价与节点或画布版本不一致');
+      const job=await canvas.run!(c.session.scope,{...input,operationId:c.operationId});c.emit('job.updated',{job});
+      const output=result(job);
+      if(['created','submitting','submitted','running','submission_unknown'].includes(job.state))output.wait={kind:'jobs',id:`jobs:${job.id}`,prompt:'节点正在生成',jobIds:[job.id]};
+      return output;
     }));
-    tools.push(tool('job_get','查询持久任务状态、存储状态和回填状态。',object({jobId:string},['jobId']),'read',async(a,c)=>{const job=await canvas.job!(c.session.scope,(a as {jobId:string}).jobId);c.emit('job.updated',{job});return result(job);}));
+    tools.push(tool('job_get','查询持久任务状态，完成后转存图片并仅追加本任务结果到原节点。',object({jobId:string},['jobId']),'write',async(a,c)=>{const job=await canvas.job!(c.session.scope,(a as {jobId:string}).jobId);c.emit('job.updated',{job});const revision=(job as unknown as {revision?:number}).revision;if(typeof revision==='number')c.emit('canvas.changed',{canvasId:c.session.scope.canvasId,revision});return result(job);}));
+    if(canvas.jobOperation)tools.find(t=>t.name==='node_run')!.reconcile=async(id,c)=>{const job=await canvas.jobOperation!(c.session.scope,id);return job?result(job):undefined;};
     if(canvas.cancel)tools.push(tool('job_cancel','请求业务服务取消任务。无法取消的远端任务继续保留真实状态。',object({jobId:string},['jobId']),'external',async(a,c)=>result(await canvas.cancel!(c.session.scope,(a as {jobId:string}).jobId))));
   }
   if(canvas.operation){

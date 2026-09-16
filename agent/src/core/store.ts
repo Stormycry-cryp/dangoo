@@ -295,6 +295,10 @@ export class SqliteStore {
     return row ? rowToSession(row) : undefined;
   }
 
+  setSessionProvider(id: string, providerId: string, model: string): void {
+    this.db.prepare('UPDATE agent_sessions SET provider_id = ?, model = ? WHERE id = ?').run(providerId, model, id);
+  }
+
   listSessions(scope?: { ownerId?: string; canvasId?: string }): Session[] {
     const clauses: string[] = [];
     const params: unknown[] = [];

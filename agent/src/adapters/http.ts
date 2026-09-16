@@ -1,4 +1,4 @@
-import type { AssetAccess, AssetGateway, AssetRecord, AssetRef, AssetSearch, CanvasGateway, CanvasOperation, CanvasSnapshot, JobRecord, Scope } from '../contracts/index.js';
+import type { AssetAccess, AssetGateway, AssetRecord, AssetRef, AssetSearch, CanvasGateway, CanvasOperation, CanvasSnapshot, JobRecord, Scope, NodeQuote } from '../contracts/index.js';
 import { CONTRACT_VERSION } from '../contracts/index.js';
 import { IntegrationError } from './assets.js';
 
@@ -19,16 +19,20 @@ export class HttpDangooGateway implements CanvasGateway, AssetGateway {
   capabilities(){return structuredClone(this.caps);}
   private async request<T>(scope:Scope,path:string,body?:unknown):Promise<T>{
     const token=await this.tokenFor(scope);if(!token)throw new IntegrationError('AUTH_REQUIRED','画布授权已失效');
-    const response=await this.fetcher(new URL(path,this.base),{method:body===undefined?'GET':'POST',redirect:'error',signal:AbortSignal.timeout(30000),headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json','X-Agent-Contract':CONTRACT_VERSION},body:body===undefined?undefined:JSON.stringify(body)});
+    const response=await this.fetcher(new URL(path,this.base),{method:body===undefined?'GET':'POST',redirect:'error',signal:AbortSignal.timeout(path.includes('/jobs/')?90000:30000),headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json','X-Agent-Contract':CONTRACT_VERSION},body:body===undefined?undefined:JSON.stringify(body)});
     if(!response.ok){let code='BRIDGE_ERROR';try{const info=await response.json() as {error?:string};if(typeof info.error==='string'&&/^[A-Z_]{1,64}$/.test(info.error))code=info.error;}catch{}throw new IntegrationError(code,`业务接口请求失败 (${response.status})`,[429,502,503,504].includes(response.status));}
     return await response.json() as T;
   }
   read(scope:Scope){return this.request<CanvasSnapshot>(scope,`canvases/${encodeURIComponent(scope.canvasId)}`);}
   apply(scope:Scope,input:{expectedRevision:number;operationId:string;operations:CanvasOperation[]}){return this.request<{revision:number;operationId:string}>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/operations`,input);}
   async operation(scope:Scope,id:string){return (await this.request<{revision:number;operationId:string}|null>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/operations/${encodeURIComponent(id)}`))??undefined;}
-  run(scope:Scope,input:{nodeId:string;operationId:string;expectedRevision:number}){if(!this.caps.jobs)throw new IntegrationError('CAPABILITY_UNAVAILABLE','生成任务接口尚未接通');return this.request<JobRecord>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/jobs`,input);}
+  quote(scope:Scope,input:{nodeId:string;expectedRevision:number}){return this.request<NodeQuote>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/quotes`,input);}
+  imageModels(scope:Scope){return this.request<unknown>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/image-models`);}
+  getQuote(scope:Scope,id:string){return this.request<NodeQuote>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/quotes/${encodeURIComponent(id)}`);}
+  approveQuote(scope:Scope,id:string){return this.request<NodeQuote>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/quotes/${encodeURIComponent(id)}/approve`,{});}
+  run(scope:Scope,input:{nodeId:string;operationId:string;expectedRevision:number;quoteId?:string}){if(!this.caps.jobs)throw new IntegrationError('CAPABILITY_UNAVAILABLE','生成任务接口尚未接通');return this.request<JobRecord>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/jobs`,input);}
   job(scope:Scope,id:string){return this.request<JobRecord>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/jobs/${encodeURIComponent(id)}`);}
-  cancel(scope:Scope,id:string){return this.request<JobRecord>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/jobs/${encodeURIComponent(id)}/cancel`,{});}
+  async jobOperation(scope:Scope,id:string){return (await this.request<JobRecord|null>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/job-operations/${encodeURIComponent(id)}`))??undefined;}
   search(scope:Scope,query:AssetSearch){if(!this.available)throw new IntegrationError('ASSET_INTEGRATION_UNAVAILABLE','资产服务尚未接通');return this.request<{items:AssetRecord[];nextCursor?:string}>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/assets/search`,query);}
   get(scope:Scope,ref:AssetRef){if(!this.available)throw new IntegrationError('ASSET_INTEGRATION_UNAVAILABLE','资产服务尚未接通');return this.request<AssetRecord>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/assets/${encodeURIComponent(ref.assetId)}/versions/${ref.version}`);}
   view(scope:Scope,ref:AssetRef){if(!this.available)throw new IntegrationError('ASSET_INTEGRATION_UNAVAILABLE','资产服务尚未接通');return this.request<AssetAccess>(scope,`canvases/${encodeURIComponent(scope.canvasId)}/assets/${encodeURIComponent(ref.assetId)}/versions/${ref.version}/access`,{purpose:'vision'});}

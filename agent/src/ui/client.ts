@@ -1,5 +1,5 @@
 import { createSessionEventStream, parseSsePayload } from './sse';
-import type { AgentClientLike, ApiError, Selection, SseEnvelope } from './types';
+import type { AgentClientLike, ApiError, Selection, SseEnvelope, ProviderSettingsInput, ProviderSettingsView } from './types';
 
 export interface AgentClientOptions {
   /** Defaults to the local Agent service behind the Vite /api proxy. */
@@ -120,6 +120,10 @@ export class AgentClient implements AgentClientLike {
   health(): Promise<unknown> {
     return this.request('/health');
   }
+
+  providerSettings() { return this.request('/settings/provider') as Promise<ProviderSettingsView>; }
+  saveProviderSettings(input: ProviderSettingsInput) { return this.request('/settings/provider', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) as Promise<ProviderSettingsView>; }
+  testProviderSettings(input: ProviderSettingsInput) { return this.request('/settings/provider/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); }
 
   capabilities(): Promise<unknown> {
     return this.request('/capabilities');
