@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.json","compilerOptions":{"noEmit":false,"declaration":true,"sourceMap":true,"rootDir":"src","outDir":"dist/runtime"},"include":["src/contracts","src/core","src/providers","src/context","src/skills","src/adapters","src/server"],"exclude":["src/ui","tests"]}

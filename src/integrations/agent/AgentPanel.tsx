@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { toast } from 'sonner'
+import { getBasename } from '@/lib/pb'
 import type { useCanvas } from '@/pages/Canvas/useCanvas'
 
 type AssetRef = { assetId: string; version: number; role?: 'reference' | 'edit_source' | 'result' }
@@ -27,8 +28,9 @@ export function AgentPanel({ vm }: { vm: ReturnType<typeof useCanvas> }) {
   latest.current = vm
   const [error, setError] = useState(false)
   const [retry, setRetry] = useState(0)
-  const moduleUrl = import.meta.env.VITE_DANGOO_AGENT_MODULE_URL as string | undefined
-  const baseUrl = (import.meta.env.VITE_DANGOO_AGENT_API_URL as string | undefined) || '/agent-api'
+  const appBase = getBasename().replace(/\/$/, '')
+  const moduleUrl = (import.meta.env.VITE_DANGOO_AGENT_MODULE_URL as string | undefined) || `${appBase}/agent/dangoo-agent-widget.js`
+  const baseUrl = (import.meta.env.VITE_DANGOO_AGENT_API_URL as string | undefined) || `${appBase}/agent-api`
   useEffect(() => {
     if (!moduleUrl || !element.current || !id) return
     let disposed = false

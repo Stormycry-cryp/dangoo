@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run agent:build && tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "agent:install": "npm --prefix agent ci",
+    "agent:dev": "npm --prefix agent run dev",
+    "agent:build": "npm --prefix agent run typecheck && npm --prefix agent run build:server && npm --prefix agent run build:widget && node scripts/prepare-agent.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",

@@ -87,6 +87,10 @@ export default defineConfig({
     // 仅本地独立跑 dev 时生效: 把前端 /__pb 代理到同机 PocketBase(7000)。
     // 生产由平台网关处理 __pb, 此代理不参与构建产物, 不影响正式环境。
     proxy: {
+      '/agent-api': {
+        target: 'http://127.0.0.1:4317',
+        rewrite: (p: string) => p.replace(/^\/agent-api/, ''),
+      },
       '/__pb': {
         target: 'http://127.0.0.1:7000',
         changeOrigin: true,
