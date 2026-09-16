@@ -5,6 +5,16 @@ import type {CanvasSnapshot,ToolContext} from '../src/contracts/index.js';
 import {ToolRegistry} from '../src/core/tool-registry.js';
 const scope={ownerId:'alice',canvasId:'art'};
 const node={id:'n1',kind:'prompt',x:1,y:2,data:{prompt:'blue'}};
+test('hosted bridge forwards PB token only through the configured header',async()=>{
+ const requests:Headers[]=[];
+ const bridge=await HttpDangooGateway.connect({baseUrl:'https://example.com/__pb/api/agent-bridge/v1/',scope,tokenFor:async()=> 'test-token',authHeader:'X-Pb-Auth',fetch:async(_url,init)=>{
+  requests.push(new Headers(init?.headers));
+  return new Response(JSON.stringify({contractVersion:'1.0.0',revision:'1',nodes:[],operations:[],jobs:false,assets:false}));
+ }});
+ await bridge.read(scope);
+ assert.equal(requests.length,2);
+ for(const headers of requests){assert.equal(headers.get('X-Pb-Auth'),'test-token');assert.equal(headers.get('Authorization'),null);}
+});
 test('canvas transaction persists revisions and idempotency; different payload and tenant rejected',async()=>{
  const g=new LocalCanvasGateway(':memory:');g.seed(scope);
  const input={expectedRevision:0,operationId:'op1',operations:[{type:'create' as const,node}]};

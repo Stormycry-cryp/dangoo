@@ -241,6 +241,7 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
       const body = await readJson(req, maxBodyBytes);
       const canvasId = asString(body.canvasId, 'canvasId');
       allowCanvas(principal, canvasId);
+      if (options.canvas) await options.canvas.read({ ownerId: principal.ownerId, canvasId });
       const defaults = options.providerSettings?.read();
       const providerId = body.providerId === undefined ? defaults?.providerId : asString(body.providerId, 'providerId', 160);
       const model = body.model === undefined ? defaults?.model : asString(body.model, 'model', 256);

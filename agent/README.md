@@ -33,6 +33,8 @@ GLM-5.3-Flash 的真实流式工具调用已验证。没有密钥时显示未配
 
 ## 更换 Provider 或密钥
 
+HTTP 桥接模式按业务账号访问多个画布，建立会话前由业务桥接校验画布权限；每个画布保持自己的唯一会话。本地内部工作台仅开放 `AGENT_CANVAS_ID` 对应的测试画布。VibeX 托管桥接设置 `DANGOO_AUTH_HEADER=X-Pb-Auth`，直连 PocketBase 保持默认 `Authorization`。
+
 编辑仅供服务端读取的 `.env`，然后重启 `npm run dev`（构建版重启 `npm start`）。
 
 | 配置项 | 用途 |

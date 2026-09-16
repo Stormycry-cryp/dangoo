@@ -671,6 +671,7 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
       } else {
         const beforeSend = (options.hostBridge as typeof options.hostBridge & { beforeSend?: () => void | Promise<void> }).beforeSend;
         if (beforeSend) await beforeSend();
+        if (destroyed || destroyTimer !== undefined) return;
         // Freeze the host selection only after the host confirms its latest canvas revision.
         const selected = selectionWithAttachments(options.hostBridge.getSelection(), state.attachments);
         frozenSelection = { ...selected, nodeIds: [...selected.nodeIds], assets: selected.assets.map((asset) => ({ ...asset })) };
@@ -679,6 +680,7 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
       if (!selection) throw new Error('无法读取当前画布选择');
       if (!sessionId) {
         await ensureSession();
+        if (destroyed || destroyTimer !== undefined) return;
         sessionId = state.session!.id;
       }
       if (!isRetry) {

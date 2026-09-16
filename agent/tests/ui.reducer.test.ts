@@ -8,6 +8,21 @@ const baseState: AgentStoreState = {
   messages: [], events: [], tools: [], jobs: [], runs: {}, registeredAssets: [], draft: '', attachments: [], connection: 'idle', lastSequence: 0, unreadCount: 0, nearBottom: true, compacting: false,
 };
 
+test('leaving a canvas during host save cannot send a deferred message', async () => {
+  let finishSave!: () => void;
+  const saved = new Promise<void>(resolve => { finishSave = resolve; });
+  let creates = 0;
+  let sends = 0;
+  const client = { createSession: async () => { creates++; }, sendMessage: async () => { sends++; } } as unknown as AgentClientLike;
+  const store = createAgentStore({ client, canvasId: 'old-canvas', hostBridge: { contractVersion: '1.0.0', canvasId: 'old-canvas', beforeSend: () => saved, getSelection: () => ({ nodeIds: [], assets: [] }), locateNode() {}, previewAsset() {} } });
+  const pending = store.sendMessage('generate');
+  store.destroy();
+  finishSave();
+  await pending;
+  assert.equal(creates, 0);
+  assert.equal(sends, 0);
+});
+
 test('canonical session initialization shares one request and restores durable history', async () => {
   let creates = 0;
   let reads = 0;

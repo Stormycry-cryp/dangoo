@@ -11,6 +11,7 @@ import { SkillRegistry, type SkillRootSpec } from '../skills/index.js';
 import { createAgentServer, listenAgentServer, type AgentServerOptions } from './server.js';
 import type { AssetGateway, CanvasGateway, Scope } from '../contracts/index.js';
 import { ProviderSettingsManager } from './provider-settings.js';
+import { createNodeApprovalPolicy } from './node-approval.js';
 
 export interface EnvironmentRuntime {
   runtime: AgentRuntime;
@@ -63,7 +64,9 @@ export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
     const baseUrl = env('DANGOO_BRIDGE_URL');
     const bridgeToken = env('DANGOO_AUTH_TOKEN');
     if (!baseUrl || !bridgeToken) throw new Error('AGENT_CANVAS_MODE=http requires DANGOO_BRIDGE_URL and DANGOO_AUTH_TOKEN');
-    const bridge = await HttpDangooGateway.connect({ baseUrl, scope, tokenFor: async () => bridgeToken });
+    const authHeader = env('DANGOO_AUTH_HEADER', 'Authorization');
+    if (authHeader !== 'Authorization' && authHeader !== 'X-Pb-Auth') throw new Error('DANGOO_AUTH_HEADER must be Authorization or X-Pb-Auth');
+    const bridge = await HttpDangooGateway.connect({ baseUrl, scope, tokenFor: async () => bridgeToken, authHeader });
     canvas = bridge;
     assets = bridge;
   } else {
@@ -98,41 +101,7 @@ export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
   const runtime = new AgentRuntime({
     store, providers, tools, skills, context: new ContextManager(), canvas, assets, model,
     limits: { maxModelTurns: numberEnv('AGENT_MAX_MODEL_TURNS', 128, 1, 10_000) },
-    beforeToolExecute: async (request, definition) => {
-      if (definition?.effect !== 'external') return;
-      if (definition.name !== 'node_run' || !canvas.getQuote) return false;
-      const quoteId = (request.call.arguments as { quoteId?: unknown })?.quoteId;
-      if (typeof quoteId !== 'string') return false;
-      const quote = await canvas.getQuote(request.session.scope, quoteId);
-      const args = request.call.arguments as { nodeId?: string; expectedRevision?: number };
-      if (args.nodeId !== quote.nodeId || args.expectedRevision !== quote.expectedRevision) return false;
-      if (quote.expiresAt <= Date.now()) return false;
-      if (quote.approved) return;
-      const authorization = (request.call.arguments as { authorization?: { userText?: unknown } }).authorization;
-      if (typeof authorization?.userText === 'string' && authorization.userText.trim()) {
-        const userText = authorization.userText;
-        const belongsToThisConversation = store.listMessages(request.session.id).some(message => message.role === 'user' && message.content.some(part => part.type === 'text' && part.text.includes(userText)));
-        if (belongsToThisConversation && canvas.approveQuote) {
-          await canvas.approveQuote(request.session.scope, quote.id);
-          return;
-        }
-      }
-      if (quote.price.estimatedPrice === 0 && canvas.approveQuote) {
-        await canvas.approveQuote(request.session.scope, quote.id);
-        return;
-      }
-      return { content: [{ type: 'text', text: '等待确认本次节点生成费用' }], wait: {
-        kind: 'approval', id: `node-quote:${request.run.id}:${quote.id}`,
-        prompt: `生成 1 张图片 · ${quote.model}\n${quote.price.isFreeThisCall ? '本次免费' : typeof quote.price.priceText === 'string' && quote.price.priceText ? quote.price.priceText : `${String(quote.price.estimatedPrice ?? '待确认')} ${String(quote.price.currency ?? 'CNY')}`}`,
-        payload: { quoteId: quote.id, nodeId: quote.nodeId, price: quote.price },
-      } };
-    },
-    onApprovalReply: async (run, wait, decision) => {
-      if (decision !== 'approve' || !wait.id.startsWith(`node-quote:${run.id}:`)) return;
-      const quoteId = wait.payload?.quoteId;
-      if (typeof quoteId !== 'string' || !canvas.approveQuote) throw new Error('节点报价不可授权');
-      await canvas.approveQuote(store.getSession(run.sessionId)!.scope, quoteId);
-    },
+    ...createNodeApprovalPolicy(canvas, store),
     systemPrompt: [
       '你是 Dangoo 节点画布里的艺术创作助手，帮助用户构思、组织参考、编辑节点并持续迭代作品。',
       '区分用户在讨论方向还是要求执行；明确的创作和修改指令可直接使用已注册工具完成。保留用户指定的主体、风格、构图与已有内容。',
@@ -150,7 +119,7 @@ export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
     host: env('AGENT_HOST', '127.0.0.1'),
     port: numberEnv('AGENT_PORT', 4317, 1, 65_535),
     bearerToken: env('AGENT_TOKEN') || undefined,
-    defaultPrincipal: { ownerId, canvasIds: [canvasId] },
+    defaultPrincipal: { ownerId, ...(isolatedWorkbench ? { canvasIds: [canvasId] } : {}) },
     configured: () => providerSettings.configured,
     providerSettings,
     canvas,

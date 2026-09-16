@@ -6,6 +6,7 @@ import { SqliteStore } from '../src/core/store.js';
 import { ToolRegistry } from '../src/core/tool-registry.js';
 import { createAgentServer } from '../src/server/server.js';
 import { ProviderRegistry } from '../src/providers/index.js';
+import { LocalCanvasGateway } from '../src/adapters/index.js';
 import type { Provider, ProviderEvent, ProviderRequest } from '../src/contracts/index.js';
 
 function provider(): Provider {
@@ -18,6 +19,31 @@ function provider(): Provider {
     },
   };
 }
+
+test('business ownership admits multiple canvases with separate canonical sessions', async () => {
+  const store = new SqliteStore();
+  const canvas = new LocalCanvasGateway(':memory:');
+  canvas.seed({ ownerId: 'alice', canvasId: 'a' });
+  canvas.seed({ ownerId: 'alice', canvasId: 'b' });
+  canvas.seed({ ownerId: 'bob', canvasId: 'private' });
+  const runtime = new AgentRuntime({ store, providers: new ProviderRegistry([provider()]), tools: new ToolRegistry(), canvas });
+  await runtime.ready();
+  const server = createAgentServer(runtime, { bearerToken: 'test', defaultPrincipal: { ownerId: 'alice' }, canvas });
+  const base = await listen(server);
+  const create = (canvasId: string) => fetch(`${base}/api/sessions`, { method: 'POST', headers: { Authorization: 'Bearer test', 'Content-Type': 'application/json' }, body: JSON.stringify({ canvasId }) });
+  try {
+    const a = await create('a');
+    const b = await create('b');
+    assert.equal(a.status, 201); assert.equal(b.status, 201);
+    const first = await a.json() as { session: { id: string } };
+    const second = await b.json() as { session: { id: string } };
+    assert.notEqual(first.session.id, second.session.id);
+    const again = await (await create('a')).json() as { session: { id: string } };
+    assert.equal(first.session.id, again.session.id);
+    assert.equal((await create('private')).ok, false);
+    assert.equal(store.listSessions({ ownerId: 'alice' }).length, 2);
+  } finally { await close(server); store.close(); canvas.close(); }
+});
 
 async function listen(server: ReturnType<typeof createAgentServer>): Promise<string> {
   await new Promise<void>((resolve, reject) => {
