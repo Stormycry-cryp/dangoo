@@ -12,6 +12,23 @@ import type { ContextManagerLike, ContextState, Provider, ProviderEvent, Provide
 
 const capabilities = () => ({ contextWindow: 20_000, maxOutputTokens: 1_000, tools: true, vision: false, parallelTools: true });
 
+test('one canonical session per owner and canvas preserves checkpoints on reentry', async () => {
+  const fixture = fixtureProvider(async function* () { yield { type: 'done', reason: 'stop' }; });
+  const store = new SqliteStore();
+  const runtime = new AgentRuntime({ store, providers: new ProviderRegistry([fixture.provider]) });
+  await runtime.ready();
+  const session = runtime.createSession({ ownerId: 'alice', canvasId: 'canvas-a' });
+  store.appendMessage({ sessionId: session.id, id: 'old-message', role: 'user', content: [{ type: 'text', text: 'preserve me' }], createdAt: 1 });
+  const repeated = await Promise.all(Array.from({ length: 8 }, async () => runtime.createSession({ ownerId: 'alice', canvasId: 'canvas-a' })));
+  assert.ok(repeated.every(item => item.id === session.id));
+  assert.equal(store.listEvents(session.id, 0).filter(event => event.type === 'session.created').length, 1);
+  assert.equal(store.listMessages(session.id)[0].id, 'old-message');
+  assert.notEqual(runtime.createSession({ ownerId: 'alice', canvasId: 'canvas-b' }).id, session.id);
+  assert.notEqual(runtime.createSession({ ownerId: 'bob', canvasId: 'canvas-a' }).id, session.id);
+  assert.equal(store.listSessions({ ownerId: 'alice', canvasId: 'canvas-a' }).length, 1);
+  store.close();
+});
+
 test('background polling records completed nodes after the Agent is stopped without resuming it', async () => {
   const store = new SqliteStore();
   const { session, run } = sessionAndRun(store);
@@ -239,6 +256,7 @@ test('compact persists the context boundary and does not consume a supplemental 
     estimate: (messages) => messages.length,
     prepare: (state) => state.messages,
     needsCompact: () => false,
+    exceedsWindow: () => false,
     compact: async (state) => {
       compactStarted();
       await compactGate;

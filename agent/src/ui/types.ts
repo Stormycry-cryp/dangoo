@@ -199,6 +199,7 @@ export interface AgentStore {
   subscribe(listener: () => void): () => void;
   dispatch(action: AgentStoreAction): void;
   loadSession(sessionId: string): Promise<void>;
+  ensureSession(): Promise<void>;
   resetSession(): void;
   startEvents(sessionId?: string): void;
   stopEvents(): void;

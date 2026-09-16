@@ -247,7 +247,9 @@ export class AgentRuntime {
     const model = input.model ?? this.defaultModel(provider);
     provider.capabilities(model); // Fail fast for malformed provider/model configuration.
     this.syncTools();
-    const session = this.store.createSession({ id: randomUUID(), ownerId: input.ownerId, canvasId: input.canvasId, createdAt: now(), providerId, model });
+    const id = randomUUID();
+    const session = this.store.createSession({ id, ownerId: input.ownerId, canvasId: input.canvasId, createdAt: now(), providerId, model });
+    if (session.id !== id) return session;
     this.store.saveCheckpoint({ id: randomUUID(), sessionId: session.id, state: { messages: [], summaryVersion: 0, pinned: {}, viewedAssets: [] }, summaryVersion: 0, createdAt: now() });
     this.publish(session.id, { type: 'session.created', data: { session } });
     return session;
@@ -746,7 +748,7 @@ export class AgentRuntime {
           // provider was running. The checkpoint boundary makes it visible on
           // this reload without resurrecting compacted history.
           state = this.loadRunState(session.id, run);
-          if (this.context.needsCompact(state, capabilities, system, toolSpecs)) throw new Error('Context remains over provider budget after compact');
+          if (this.context.exceedsWindow(state, capabilities, system, toolSpecs)) throw new Error('Context remains over provider budget after compact');
         }
         const prepared = this.context.prepare(state, system, capabilities, toolSpecs);
         const messages = await this.resolveProviderMessages(prepared, session.scope, controller.signal);

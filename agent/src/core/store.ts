@@ -139,6 +139,12 @@ export class SqliteStore {
         model TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_scope ON agent_sessions(owner_id, canvas_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS agent_canvas_sessions (
+        owner_id TEXT NOT NULL,
+        canvas_id TEXT NOT NULL,
+        session_id TEXT NOT NULL UNIQUE REFERENCES agent_sessions(id),
+        PRIMARY KEY(owner_id, canvas_id)
+      );
       CREATE TABLE IF NOT EXISTS agent_runs (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -283,11 +289,21 @@ export class SqliteStore {
   }
 
   createSession(input: CreateSessionRecord): Session {
-    this.db.prepare(`INSERT INTO agent_sessions(id,owner_id,canvas_id,created_at,provider_id,model) VALUES(?,?,?,?,?,?)`)
-      .run(input.id, input.ownerId, input.canvasId, input.createdAt, input.providerId, input.model);
-    const session = this.getSession(input.id);
-    if (!session) throw new Error('session insert failed');
-    return session;
+    // The write lock covers legacy selection and insertion across connections.
+    // Existing duplicate histories remain addressable; the oldest is canonical.
+    return this.db.transaction(() => {
+      const mapped = this.db.prepare('SELECT session_id FROM agent_canvas_sessions WHERE owner_id = ? AND canvas_id = ?')
+        .get(input.ownerId, input.canvasId) as Row | undefined;
+      if (mapped) return this.getSession(String(mapped.session_id))!;
+      const existing = this.db.prepare('SELECT * FROM agent_sessions WHERE owner_id = ? AND canvas_id = ? ORDER BY created_at ASC, id ASC LIMIT 1')
+        .get(input.ownerId, input.canvasId) as Row | undefined;
+      if (!existing) this.db.prepare(`INSERT INTO agent_sessions(id,owner_id,canvas_id,created_at,provider_id,model) VALUES(?,?,?,?,?,?)`)
+        .run(input.id, input.ownerId, input.canvasId, input.createdAt, input.providerId, input.model);
+      const session = existing ? rowToSession(existing) : this.getSession(input.id)!;
+      this.db.prepare('INSERT INTO agent_canvas_sessions(owner_id,canvas_id,session_id) VALUES(?,?,?)')
+        .run(input.ownerId, input.canvasId, session.id);
+      return session;
+    }).immediate();
   }
 
   getSession(id: string): Session | undefined {

@@ -39,6 +39,7 @@ export interface ContextManagerLike {
   estimate(messages:Message[]):number;
   prepare(state:ContextState, system:string, capabilities:ModelCapabilities, tools?:ToolSpec[]):Message[];
   needsCompact(state:ContextState, capabilities:ModelCapabilities, system?:string, tools?:ToolSpec[]):boolean;
+  exceedsWindow(state:ContextState, capabilities:ModelCapabilities, system?:string, tools?:ToolSpec[]):boolean;
   compact(state:ContextState, provider:Provider, model:string, signal:AbortSignal):Promise<CompactResult>;
 }
 export interface AssetRecord extends AssetRef {name:string; mediaType:'image'|'video'|'audio'; source:'upload'|'generation'|'import'|'edit'; metadataRevision:number; width?:number; height?:number; durationMs?:number; description?:string; tags:string[]; canvasId?:string; createdAt:number; parents:AssetRef[]; storageState:'pending'|'stored'|'failed';}

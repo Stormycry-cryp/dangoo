@@ -23,11 +23,9 @@ import type {
   FloatingAgentChatProps,
   JobCardData,
   PendingInput,
-  AgentSessionView,
   ToolStep,
 } from './types';
 import { assetKey, safeHttpUrl } from './types';
-import { sessionsFromUnknown } from './store';
 
 function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true };
@@ -77,39 +75,6 @@ type IconName = 'spark' | 'chevron' | 'close' | 'history' | 'settings' | 'send' 
 
 function useAgentState<T>(store: AgentStore, selector: (state: ReturnType<AgentStore['getState']>) => T): T {
   return useSyncExternalStore(store.subscribe, () => selector(store.getState()), () => selector(store.getState()));
-}
-
-function formatSessionTime(value?: number): string {
-  if (!value) return '新会话';
-  try {
-    return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
-  } catch {
-    return '新会话';
-  }
-}
-
-function sessionStorageKey(canvasId: string): string {
-  return `dangoo-agent:session:${canvasId}`;
-}
-
-function readStoredSessionId(canvasId: string): string | undefined {
-  if (typeof window === 'undefined') return undefined;
-  try {
-    const value = window.sessionStorage.getItem(sessionStorageKey(canvasId));
-    return value && value.length <= 256 ? value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function writeStoredSessionId(canvasId: string, sessionId?: string): void {
-  if (typeof window === 'undefined') return;
-  try {
-    if (sessionId) window.sessionStorage.setItem(sessionStorageKey(canvasId), sessionId);
-    else window.sessionStorage.removeItem(sessionStorageKey(canvasId));
-  } catch {
-    // Embedded hosts may disable session storage; the live store still works.
-  }
 }
 
 function safeInlineNodes(text: string, keyPrefix = 'inline'): ReactNode[] {
@@ -311,17 +276,13 @@ export function FloatingAgentChat({
   const fallbackClientRef = useRef<AgentClient | undefined>(undefined);
   if (!fallbackClientRef.current) fallbackClientRef.current = new AgentClient();
   const resolvedClient = client ?? fallbackClientRef.current;
-  const store = useMemo(() => createAgentStore({ client: resolvedClient, hostBridge, canvasId, sessionId }), [resolvedClient, hostBridge, canvasId, sessionId]);
+  const store = useMemo(() => createAgentStore({ client: resolvedClient, hostBridge, canvasId }), [resolvedClient, hostBridge, canvasId]);
   const state = useAgentState(store, (value) => value);
   const [internalOpen, setInternalOpen] = useState(defaultOpen);
   const isOpen = open ?? internalOpen;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [savedSettings, setSavedSettings] = useState<ProviderSettingsView>();
   const configured = savedSettings?.hasKey ?? serviceConfigured;
-  const [historyOpen, setHistoryOpen] = useState(false);
-  const [historySessions, setHistorySessions] = useState<AgentSessionView[]>([]);
-  const [historyBusy, setHistoryBusy] = useState(false);
-  const [historyError, setHistoryError] = useState<string>();
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [localNotice, setLocalNotice] = useState<string>();
   const [composerFocused, setComposerFocused] = useState(false);
@@ -330,7 +291,6 @@ export function FloatingAgentChat({
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const previousMessageCount = useRef(0);
-  const historyAttemptStore = useRef<AgentStore | undefined>(undefined);
 
   useEffect(() => {
     store.resume();
@@ -341,39 +301,14 @@ export function FloatingAgentChat({
   useEffect(() => {
     if (initialAttachments?.length) initialAttachments.forEach((attachment) => store.addAttachment(attachment));
   }, [initialAttachments, store]);
-  const refreshHistory = useCallback(async (autoSelect = false) => {
-    if (!resolvedClient.listSessions) return;
-    setHistoryBusy(true);
-    setHistoryError(undefined);
-    try {
-      const value = await resolvedClient.listSessions(canvasId);
-      const sessions = sessionsFromUnknown(value, canvasId).sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0));
-      setHistorySessions(sessions);
-      if (autoSelect && !sessionId && !store.getState().session) {
-        const storedId = readStoredSessionId(canvasId);
-        const candidate = (storedId ? sessions.find((item) => item.id === storedId) : undefined) ?? sessions[0];
-        if (candidate) await store.loadSession(candidate.id);
-      }
-    } catch (error) {
-      setHistoryError(error instanceof Error ? error.message : '无法读取历史会话');
-    } finally {
-      setHistoryBusy(false);
-    }
-  }, [canvasId, resolvedClient, sessionId, store]);
   useEffect(() => {
-    if (sessionId || state.session || historyAttemptStore.current === store) return;
-    historyAttemptStore.current = store;
-    void refreshHistory(true);
-  }, [refreshHistory, sessionId, state.session, store]);
-  useEffect(() => {
-    if (historyOpen) void refreshHistory(false);
-  }, [historyOpen, refreshHistory]);
-  useEffect(() => {
-    if (state.session?.id) {
-      writeStoredSessionId(canvasId, state.session.id);
-      setHistorySessions((current) => current.some((item) => item.id === state.session?.id) ? current : [state.session!, ...current]);
-    }
-  }, [canvasId, state.session]);
+    if (!configured) return;
+    let active = true;
+    void store.ensureSession().catch((error: unknown) => {
+      if (active) store.dispatch({ type: 'error.changed', error: error instanceof Error ? error.message : '无法恢复画布对话' });
+    });
+    return () => { active = false; };
+  }, [configured, store]);
   useEffect(() => {
     if (isOpen) requestAnimationFrame(() => composerRef.current?.focus());
   }, [isOpen]);
@@ -392,7 +327,7 @@ export function FloatingAgentChat({
 
   const onPanelKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     event.stopPropagation();
-    if (event.key === 'Escape' && !settingsOpen && !historyOpen) {
+    if (event.key === 'Escape' && !settingsOpen) {
       event.preventDefault();
       setOpen(false);
     }
@@ -402,27 +337,6 @@ export function FloatingAgentChat({
     if (!state.draft.trim() || !configured || attachmentBusy) return;
     await store.sendMessage(state.draft);
   }, [attachmentBusy, configured, state.draft, store]);
-
-  const selectSession = useCallback(async (nextSessionId: string) => {
-    if (nextSessionId === state.session?.id) {
-      setHistoryOpen(false);
-      return;
-    }
-    setHistoryBusy(true);
-    try {
-      await store.loadSession(nextSessionId);
-      setHistoryOpen(false);
-    } finally {
-      setHistoryBusy(false);
-    }
-  }, [state.session?.id, store]);
-
-  const startNewSession = useCallback(() => {
-    store.resetSession();
-    writeStoredSessionId(canvasId);
-    setHistoryOpen(false);
-    setHistoryError(undefined);
-  }, [canvasId, store]);
 
   const onComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     event.stopPropagation();
@@ -493,21 +407,10 @@ export function FloatingAgentChat({
   return <aside className={`agent-panel${className ? ` ${className}` : ''}`} style={panelStyle} onKeyDown={onPanelKeyDown} onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()} onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); }} onDrop={onDrop} aria-label="Agent 悬浮对话">
     <header className="agent-panel__header">
       <div className="agent-brand"><span className="agent-brand__mark"><Icon name="spark" size={16} /></span><div><strong>Agent</strong><span>当前画布</span></div></div>
-      <div className="agent-panel__actions"><button type="button" className={`agent-icon-button${historyOpen ? ' agent-icon-button--active' : ''}`} onClick={() => { setHistoryOpen((value) => !value); setSettingsOpen(false); }} aria-label="查看历史" aria-pressed={historyOpen}><Icon name="history" size={15} /></button><button type="button" className={`agent-icon-button${settingsOpen ? ' agent-icon-button--active' : ''}`} onClick={() => { setSettingsOpen((value) => !value); setHistoryOpen(false); }} aria-label="Agent 设置" aria-pressed={settingsOpen}><Icon name="settings" size={15} /></button><button type="button" className="agent-icon-button agent-icon-button--close" onClick={() => setOpen(false)} aria-label="收起 Agent"><Icon name="close" size={15} /></button></div>
+      <div className="agent-panel__actions"><button type="button" className={`agent-icon-button${settingsOpen ? ' agent-icon-button--active' : ''}`} onClick={() => setSettingsOpen((value) => !value)} aria-label="Agent 设置" aria-pressed={settingsOpen}><Icon name="settings" size={15} /></button><button type="button" className="agent-icon-button agent-icon-button--close" onClick={() => setOpen(false)} aria-label="收起 Agent"><Icon name="close" size={15} /></button></div>
     </header>
     <div className="agent-panel__subhead"><StatusLine state={state} serviceState={savedSettings?.hasKey ? 'ready' : serviceState} providerName={savedSettings?.providerId ?? serviceConfig?.providerName ?? state.session?.providerId} model={savedSettings?.model ?? serviceConfig?.model ?? state.session?.model} /></div>
     {settingsOpen ? <ProviderSettings client={resolvedClient} onSaved={setSavedSettings} onClose={() => setSettingsOpen(false)} /> : null}
-    {historyOpen ? <section className="agent-popover agent-history" aria-label="会话历史">
-      <div className="agent-popover__head"><strong>历史会话</strong><div className="agent-history__head-actions"><button type="button" className="agent-text-button" onClick={startNewSession}><Icon name="plus" size={12} />新建</button><button type="button" className="agent-text-button" onClick={() => setHistoryOpen(false)}>完成</button></div></div>
-      {historyBusy && !historySessions.length ? <div className="agent-history__loading"><span className="agent-spinner" />读取中</div> : null}
-      {historyError ? <div className="agent-history__error" role="alert">{historyError}<button type="button" className="agent-text-button" onClick={() => void refreshHistory(false)}><Icon name="refresh" size={11} />重试</button></div> : null}
-      {historySessions.length ? <div className="agent-history__list">{historySessions.map((item) => {
-        const current = item.id === state.session?.id;
-        return <button type="button" className={`agent-history__item${current ? ' agent-history__item--current' : ''}`} key={item.id} onClick={() => void selectSession(item.id)} disabled={historyBusy}>
-          <span className="agent-history__dot" /><span className="agent-history__item-copy"><strong>{current ? '当前画布对话' : '画布对话'}</strong><small>{formatSessionTime(item.createdAt)}{item.model ? ` · ${item.model}` : ''}</small></span>{current ? <Icon name="check" size={12} /> : <Icon name="arrow" size={12} />}
-        </button>;
-      })}</div> : !historyBusy && !historyError ? <div className="agent-history__empty">暂无历史会话</div> : null}
-    </section> : null}
     <div className="agent-conversation" ref={conversationRef} onScroll={onConversationScroll} tabIndex={0} aria-label="对话消息">
       {state.messages.length === 0 ? <div className="agent-empty"><span className="agent-empty__mark"><Icon name="spark" size={17} /></span><p>描述你想在画布上完成的创作。</p><div className="agent-suggestions"><button type="button" onClick={() => store.setDraft('整理这组节点的构图')}>整理构图</button><button type="button" onClick={() => store.setDraft('分析当前选中的素材')}>分析选中素材</button></div></div> : null}
       {state.messages.map((message) => <MessageBubble key={message.id} message={message} />)}

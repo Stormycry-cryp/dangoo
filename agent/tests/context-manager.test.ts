@@ -11,6 +11,22 @@ const capabilities: ModelCapabilities = {
   parallelTools: true,
 };
 
+test('automatic compact defaults to 256000 total tokens and respects smaller model windows', () => {
+  const manager = new ContextManager({ outputReserve: 1000 });
+  const state = { messages: [message('u1', 'user', 'x'.repeat(256_000 * 4))], summaryVersion: 0, pinned: {}, viewedAssets: [] };
+  const large = { ...capabilities, contextWindow: 1_000_000 };
+  assert.equal(manager.needsCompact(state, large), true);
+  state.messages = [message('u1', 'user', 'x'.repeat(250_000 * 4))];
+  assert.equal(manager.needsCompact(state, large), false);
+  assert.equal(manager.needsCompact(state, large, 'x'.repeat(6_000 * 4)), true);
+  assert.equal(manager.exceedsWindow(state, large, 'x'.repeat(6_000 * 4)), false);
+  assert.equal(manager.needsCompact(state, { ...large, contextWindow: 128_000 }), true);
+  assert.equal(manager.exceedsWindow(state, { ...large, contextWindow: 128_000 }), true);
+  const custom = new ContextManager({ outputReserve: 1000, autoCompactTokenLimit: 2000 });
+  state.messages = [message('u1', 'user', 'x'.repeat(4000))];
+  assert.equal(custom.needsCompact(state, large), true);
+});
+
 function message(id: string, role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
   return { id, role, content: [{ type: 'text', text }], createdAt: Number(id.replace(/\D/g, '')) || 1, ...extra };
 }

@@ -635,6 +635,19 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
     dispatch({ type: 'session.reset' });
   };
 
+  let sessionPromise: Promise<void> | undefined;
+  const ensureSession = async () => {
+    if (state.session) return;
+    if (!sessionPromise) sessionPromise = (async () => {
+      const created = await options.client.createSession({ canvasId: options.canvasId, providerId: options.providerId, model: options.model });
+      const session = sessionFromUnknown(created, options.canvasId);
+      if (!session || session.canvasId !== options.canvasId) throw new Error('无法读取当前画布会话');
+      await loadSession(session.id);
+      if (!state.session || state.session.id !== session.id) throw new Error('无法恢复当前画布会话');
+    })().finally(() => { sessionPromise = undefined; });
+    await sessionPromise;
+  };
+
   const resume = () => {
     if (destroyTimer !== undefined) {
       clearTimeout(destroyTimer);
@@ -665,11 +678,8 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
       const selection = frozenSelection;
       if (!selection) throw new Error('无法读取当前画布选择');
       if (!sessionId) {
-        const created = await options.client.createSession({ canvasId: options.canvasId, providerId: options.providerId, model: options.model });
-        const session = sessionFromUnknown(created, options.canvasId);
-        if (!session) throw new Error('创建会话响应缺少会话 ID');
-        sessionId = session.id;
-        dispatch({ type: 'session.loaded', session });
+        await ensureSession();
+        sessionId = state.session!.id;
       }
       if (!isRetry) {
         const attachments = state.attachments.map((attachment) => ({ ...attachment, ref: { ...attachment.ref } }));
@@ -766,6 +776,7 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
     },
     dispatch,
     loadSession,
+    ensureSession,
     resetSession,
     startEvents,
     stopEvents,

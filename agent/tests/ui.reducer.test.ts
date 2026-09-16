@@ -8,6 +8,25 @@ const baseState: AgentStoreState = {
   messages: [], events: [], tools: [], jobs: [], runs: {}, registeredAssets: [], draft: '', attachments: [], connection: 'idle', lastSequence: 0, unreadCount: 0, nearBottom: true, compacting: false,
 };
 
+test('canonical session initialization shares one request and restores durable history', async () => {
+  let creates = 0;
+  let reads = 0;
+  const session = { id: 'canonical', scope: { canvasId: 'current' }, createdAt: 1 };
+  const client = {
+    createSession: async () => { creates += 1; await Promise.resolve(); return { session }; },
+    getSession: async () => { reads += 1; return { session, messages: [{ id: 'old', role: 'user', content: [{ type: 'text', text: 'old history' }], createdAt: 1 }] }; },
+    streamEvents: async () => (async function* () {})(),
+  } as unknown as AgentClientLike;
+  const store = createAgentStore({ client, canvasId: 'current', hostBridge: { contractVersion: '1.0.0', canvasId: 'current', getSelection: () => ({ nodeIds: [], assets: [] }), locateNode() {}, previewAsset() {} } });
+  await Promise.all([store.ensureSession(), store.ensureSession()]);
+  await store.ensureSession();
+  assert.equal(creates, 1);
+  assert.equal(reads, 1);
+  assert.equal(store.getState().session?.id, 'canonical');
+  assert.equal(store.getState().messages[0].text, 'old history');
+  store.destroy();
+});
+
 function event(sequence: number, type: string, data: Record<string, unknown>): AgentEventView {
   return { id: `${type}:${sequence}`, sequence, type, data, createdAt: sequence };
 }

@@ -67,6 +67,8 @@ export interface ContextManagerOptions {
   imageTokens?: number;
   assetTokens?: number;
   outputReserve?: number | ((capabilities: ModelCapabilities) => number);
+  /** Total request estimate threshold, including system, tools and output reserve. */
+  autoCompactTokenLimit?: number;
   /** Number of complete history units retained after successful compaction. */
   compactTailUnits?: number;
   /** Maximum token target for the retained tail; pairing can make it larger. */
@@ -277,6 +279,7 @@ export class ContextManager {
   private readonly imageTokens: number;
   private readonly assetTokens: number;
   private readonly outputReserveOption: ContextManagerOptions['outputReserve'];
+  private readonly autoCompactTokenLimit: number;
   private readonly compactTailUnits: number;
   private readonly compactTailTokens?: number;
   private readonly maxMessageTextChars: number;
@@ -286,6 +289,7 @@ export class ContextManager {
     this.imageTokens = Math.max(1, options.imageTokens ?? DEFAULT_IMAGE_TOKENS);
     this.assetTokens = Math.max(1, options.assetTokens ?? DEFAULT_ASSET_TOKENS);
     this.outputReserveOption = options.outputReserve;
+    this.autoCompactTokenLimit = Math.max(1, Math.floor(options.autoCompactTokenLimit ?? 256_000));
     this.compactTailUnits = Math.max(1, Math.floor(options.compactTailUnits ?? DEFAULT_TAIL_UNITS));
     this.compactTailTokens = options.compactTailTokens;
     this.maxMessageTextChars = Math.max(64, Math.floor(options.maxMessageTextChars ?? 20_000));
@@ -354,6 +358,15 @@ export class ContextManager {
       `${system}\n${state.summary ?? ''}\n${formatPinnedContext(state)}`,
       tools,
       capabilities,
+    ) >= Math.min(this.autoCompactTokenLimit, capabilities.contextWindow);
+  }
+
+  exceedsWindow(state: ContextState, capabilities: ModelCapabilities, system = '', tools: ToolSpec[] = []): boolean {
+    return this.estimateRequest(
+      state.messages,
+      `${system}\n${state.summary ?? ''}\n${formatPinnedContext(state)}`,
+      tools,
+      capabilities,
     ) > capabilities.contextWindow;
   }
 
@@ -417,7 +430,7 @@ export class ContextManager {
     return this.compact(state, provider, model, signal, 'auto');
   }
 
-  /** Automatic contract: only invoke compact when the current request cannot fit. */
+  /** Compact automatically at the configured threshold or the provider window. */
   async compactIfNeeded(
     state: ContextState,
     provider: Provider,
@@ -490,7 +503,7 @@ export class ContextManager {
 
   private compactTail(state: ContextState, capabilities: ModelCapabilities): Message[] {
     const units = makeHistoryUnits(state.messages);
-    const target = this.compactTailTokens ?? Math.max(1, Math.floor(this.promptBudget(capabilities) * DEFAULT_TAIL_FRACTION));
+    const target = this.compactTailTokens ?? Math.max(1, Math.floor(Math.min(this.promptBudget(capabilities), this.autoCompactTokenLimit) * DEFAULT_TAIL_FRACTION));
     const selected: HistoryUnit[] = [];
     let used = 0;
     for (let i = units.length - 1; i >= 0 && selected.length < this.compactTailUnits; i -= 1) {
