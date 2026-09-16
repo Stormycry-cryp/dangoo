@@ -59,10 +59,11 @@ module.exports = __toCommonJS(pocketbase_mapping_exports);
 
 // src/adapters/assets.ts
 var IntegrationError = class extends Error {
-  constructor(code, message, retryable = false) {
+  constructor(code, message, retryable = false, status) {
     super(message);
     this.code = code;
     this.retryable = retryable;
+    this.status = status;
     this.name = "IntegrationError";
   }
 };

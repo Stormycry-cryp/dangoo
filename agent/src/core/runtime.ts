@@ -328,7 +328,7 @@ export class AgentRuntime {
           if (attached && attached.id !== active.id) return attached;
         }
         const message = this.appendUserMessage(sessionId, active.id, input.text, selection);
-        this.publish(sessionId, { runId: active.id, turnId: active.turnId, type: 'message.accepted', data: { message, supplemental: true } });
+        this.publish(sessionId, { runId: active.id, turnId: active.turnId, type: 'message.accepted', data: { message, requestId: input.requestId, supplemental: true } });
         return active;
       }
       this.syncTools();
@@ -364,7 +364,7 @@ export class AgentRuntime {
       }
       this.snapshots.set(run.id, initialSnapshot);
       const message = this.appendUserMessage(sessionId, run.id, input.text, selection);
-      this.publish(sessionId, { runId: run.id, turnId: run.turnId, type: 'message.accepted', data: { message } });
+      this.publish(sessionId, { runId: run.id, turnId: run.turnId, type: 'message.accepted', data: { message, requestId: input.requestId } });
       this.publishRun(run);
       this.scheduleRun(run.id);
       return run;

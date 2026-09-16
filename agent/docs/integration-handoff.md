@@ -1,20 +1,24 @@
 # Agent 对接与注意事项
 
-更新：2026-09-16。适用：`feat/independent-agent-bridge`，代码基线 `a4f5b0b`，PR：https://github.com/dango10031/dangoo/pull/1 。
+更新：2026-09-17。适用：`feat/independent-agent-bridge`，PR：https://github.com/dango10031/dangoo/pull/1 。
 
 ## 交付结论
 
-Agent 核心、原画布挂载和首期图片节点桥接已经实现，72 项自动测试及原应用集成构建通过。当前是功能分支候选，尚未合并、部署或完成全部浏览器验收，不能表述为已经上线或全部 PRD 已验收。
+Agent 核心、原画布挂载和首期图片节点桥接已实现。本轮增加原画布用户鉴权、初始服装详情页 Skill、`/` 与按钮调用、本地确定性 mock。当前是功能分支候选，尚未合并或部署线上；本地验收不代表全部 PRD 或生产验收。
 
 用户已确认线上原节点生成可用，本次以此为前提。后续验证重点是 Agent 到节点的调用、授权、状态恢复和结果回写，不重复验收原生成服务。
+
+本轮验证：Agent `npm test` 86/86；宿主 `agent-auth`、`agent-pb-auth`、`agent-canvas-save` 6/6；根目录 `npm run build` 通过。浏览器通过 `/` 键盘选择、Skill 请求参数、画布写入与版本增长、刷新恢复、按钮搜索/空结果、停止、桌面及窄屏弹层边界。原画布与构建 widget 的浏览器测试通过既有登录弹窗、PB 凭据转发、退出卸载与 401 后重新登录。PB HTTP 响应及验签平台边界使用本地 fixture；未调用付费生成，未验证线上部署。
+
+验收中修复：widget 库构建中的 `process.env.NODE_ENV` 导致浏览器加载失败；SSE 先于 POST 返回导致重复气泡（按 requestId 关联）；技能弹层裁切；mock 多轮误用旧工具结果。
 
 ## 已有能力与边界
 
 | 能力 | 当前状态 | 注意事项 |
 | --- | --- | --- |
-| 独立 runtime、Tool/Provider/Skill Registry | 已实现并测试 | 运行不依赖 Codex 服务；Skill 机制已就位，业务创作 Skill 内容另行接入 |
+| 独立 runtime、Tool/Provider/Skill Registry | 已实现并测试 | 内置 `fashion-ecommerce-image-set`，支持 `/`、按钮搜索、选择及移除；默认加载 builtin，workspace 同名优先 |
 | GLM-5.3-Flash | 真实文本流及工具调用通过 | 图片理解及账户真实上下文容量未实测 |
-| Provider 配置 | 可点击设置，填写 Provider、模型、地址、密钥，测试并保存 | 设置为服务实例级，尚未按多用户拆分 |
+| Provider 配置 | 服务实例级配置 | 仅 `AGENT_OWNER_ID` 指定的已认证管理员可管理；普通用户不能读取或修改配置 |
 | 画布上下文 | 同一 owner + canvas 固定一个持久会话 | 已有重复历史保留，最早创建的会话作为主会话；旧重复会话没有 UI 切换入口 |
 | 自动压缩 | 默认 256,000 tokens 触发，保留原历史、工具配对及固定信息 | 更小 Provider 窗口提前触发；详见下文 |
 | 画布编辑 | 创建、修改、连接、布局、分组等 | 通过版本及幂等校验；不能把节点可编辑解释为所有节点均可运行 |
@@ -22,6 +26,16 @@ Agent 核心、原画布挂载和首期图片节点桥接已经实现，72 项�
 | 任务恢复 | 轮询、提交未知对账、永久存储后回写节点 | 未接入真实远端取消；停止对话不等于取消已提交生成 |
 | 资产工具 | search/get/view 接口已预留 | 无真实资产服务时明确不可用；不伪造资产 ID |
 | 悬浮 UI | 原画布内固定深色面板、流式正文与工具/任务状态 | 新设置面板的浏览器视觉验收尚未完成 |
+
+## 本地 Agent mock
+
+在 `agent/` 分别运行 `npm run dev:mock` 与 `npm run dev:ui`，打开 `http://127.0.0.1:5173`。mock 使用真实 runtime、SQLite、HTTP/SSE、Skill 与画布工具，仅替换模型为确定性实现，数据默认写入独立临时目录。它不读取真实 Provider 凭据，不暴露生图执行工具。这个演示入口不代表原应用的登录页或完整画布。
+
+输入普通文字测试读取和新增提示词节点；输入 `mock:question` 测试补充问题，`mock:approval` 测试确认，`mock:failed` 测试失败，`mock:stop` 测试持续流与停止。`/fashion` 或“技能”按钮选择真实内置服装详情页 Skill。
+
+`npm run smoke:mock` 验证多轮读写、版本增长、Skill 正文注入、持久会话、SSE、问答、确认、失败及停止。另可在安装 Playwright 的机器运行 `node scripts/browser-smoke.mjs`；外部安装通过 `PLAYWRIGHT_MODULE` 指定，截图默认写入 `agent/artifacts/mock-browser/`。原宿主鉴权测试在项目根执行 `node --test tests/agent-auth.test.mjs`，后端认证测试在 `agent/` 执行 `npm test`。
+
+原画布浏览器认证测试：先在项目根执行 `npm run build`，再启动 `npm run dev -- --host 127.0.0.1 --port 5174`；在 `agent/` 执行 `node scripts/auth-browser-smoke.mjs`。该脚本只向本地测试页填入 fixture 账号，拦截业务 HTTP，不使用真实账号或生产数据。
 
 ## 上线前必须对接
 
@@ -35,28 +49,27 @@ Agent 核心、原画布挂载和首期图片节点桥接已经实现，72 项�
 
 不能只复制 widget 或单个 hook。业务侧手动保存与 Agent 写入需同时使用本分支事务方案，避免互相覆盖。桥接源文件位于 `agent/integrations/pocketbase/`，生成入口为 `agent/scripts/build-host-bridge.mjs`；修改源文件后重新生成。
 
-### 2. 认证、代理和多用户
+### 2. 复用原画布用户鉴权
 
-当前 `createEnvironmentRuntime()` 是单业务账号入口，通过 `AGENT_OWNER_ID` 与固定 `DANGOO_AUTH_TOKEN` 绑定该账号。HTTP 模式允许此账号访问多个画布，每次建立会话先调用业务桥接读取并校验权限；本地工作台仍限于测试画布。
+宿主从现有 PocketBase `authStore` 获取登录态，并通过原 `getAuthHeaders()` 发送凭据。本地使用 `Authorization`，托管网关使用 `X-Pb-Auth`；Agent 模块和 API 必须同源。登录变化会卸载旧 widget，阻止旧客户端继续发送；401 清理仍对应这次请求的失效登录态，避免清理已切换的新账号。
 
-**多用户生产接入尚未完成。** 需要宿主登录入口验证用户身份，生成可信的 Agent principal，并按该主体取得对应业务凭据。底层支持 token 到 principal 映射及 `tokenFor(scope)` 注入，但默认启动器没有完成动态账号认证、凭据刷新或注销接线。不能把同一个测试账号 token 共用于所有访问者。
+HTTP 模式每次请求通过 PocketBase `/api/agent-bridge/v1/identity` 验证凭据。该端点使用原钱包中间件的真实验签、账号封禁检查与 `authEmail`，不读取客户端声称的 ownerId。会话按服务端确认的邮箱与画布隔离，画布编辑、报价、生成与任务轮询继续携带该用户凭据，由原业务接口检查画布归属。
 
-宿主 `AgentPanel.tsx` 当前只向 widget 传递地址、画布 ID 和 hostBridge，没有接入用户 Agent token。widget 支持内存 token；部署时须补齐可信认证入口与宿主传入方式。Provider key 不能充当 Agent 登录 token。
+业务凭据仅保存在 Agent 进程内存，不写入 SQLite、前端新存储或 Skill。重启后后台任务需对应用户重新认证才能恢复访问；无有效凭据不会借用其他账号执行。`DANGOO_AUTH_TOKEN` 不再用作 HTTP 模式的共享用户身份。独立 `local` 工作台只用于显式本地测试。
 
 生产需将同源 `/agent-api` 代理到 Agent 的本机监听端口，去掉 `/agent-api` 前缀；Vite 的开发代理不会进入生产产物。SSE 应关闭响应缓冲并配置足够的读超时，验证断线后按 sequence 重放。服务只监听 loopback，保留 Host/Origin 校验；若代理改写 Host，需要匹配其可信来源配置，不能通过通配 CORS 解决。
 
-Provider 设置目前保存在一个实例的文件中。多用户上线前应确定由管理员统一配置还是按用户分别配置，并实现相应权限及存储隔离；当前代码不能宣称已提供每用户独立密钥。
+Provider 由管理员统一配置，保存在实例私有文件。HTTP 模式未设置 `AGENT_OWNER_ID` 时不开放配置管理；这不影响使用服务端已配置模型。没有新增账号系统或每用户模型密钥管理。
 
 ### 3. 服务配置
 
 | 配置 | 所在进程 | 要求 |
 | --- | --- | --- |
 | `AGENT_CANVAS_MODE=http` | Agent | 产品接入使用 HTTP 桥接 |
-| `AGENT_OWNER_ID` | Agent | 当前业务账号身份，现有桥接使用业务邮箱 |
+| `AGENT_OWNER_ID` | Agent | HTTP 模式下仅指定可管理 Provider 的管理员邮箱；会话身份由 PB 验证得出 |
 | `DANGOO_BRIDGE_URL` | Agent | 指向已部署的 `/api/agent-bridge/v1/`；托管域名通常带 `/__pb` |
-| `DANGOO_AUTH_TOKEN` | Agent | 对应当前业务用户的有效凭据，服务端保存 |
 | `DANGOO_AUTH_HEADER` | Agent | 直连 PB 为 `Authorization`；VibeX 托管网关为 `X-Pb-Auth` |
-| `AGENT_TOKEN` | Agent | Agent 自身认证，与 PB token 和模型 key 分开 |
+| `AGENT_TOKEN` | Agent | 仅显式 local 工作台的可选访问令牌；HTTP 模式使用原画布登录凭据 |
 | `AGENT_DATA_DIR` | Agent | 可写且持久的本机目录，包含会话及私有配置 |
 | `AGENT_AIGC_INTERNAL_URL` | PocketBase | 本机 PB 的 HTTP 地址，端口与实际服务一致；缺失时 jobs 关闭 |
 | `AGENT_CONTEXT_WINDOW` | Agent | 模型实际容量，默认 128000，不能凭压缩目标扩大 |

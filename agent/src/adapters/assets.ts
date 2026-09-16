@@ -1,7 +1,7 @@
 import type { AssetGateway, AssetRef, AssetSearch, Scope } from '../contracts/index.js';
 
 export class IntegrationError extends Error {
-  constructor(public code:string, message:string, public retryable=false) { super(message); this.name='IntegrationError'; }
+  constructor(public code:string, message:string, public retryable=false, public status?:number) { super(message); this.name='IntegrationError'; }
 }
 /** Explicitly unavailable: an empty inventory would incorrectly imply that no assets exist. */
 export class UnavailableAssetGateway implements AssetGateway {

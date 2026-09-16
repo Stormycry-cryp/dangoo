@@ -18,6 +18,10 @@ export interface AgentServerOptions {
   tokens?: Record<string, AgentPrincipal> | Map<string, AgentPrincipal>;
   tokenScopes?: Record<string, AgentPrincipal> | Map<string, AgentPrincipal>;
   defaultPrincipal?: AgentPrincipal;
+  /** Authenticate each non-health request against the current host identity. */
+  authenticate?: (request: IncomingMessage) => Promise<AgentPrincipal>;
+  /** Exact owner allowed to read or change provider settings. */
+  providerSettingsOwnerId?: string;
   requireAuth?: boolean;
   allowUnauthenticatedLocal?: boolean;
   corsOrigin?: string;
@@ -31,6 +35,13 @@ export interface AgentServerOptions {
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string, readonly code = 'bad_request') { super(message); this.name = 'HttpError'; }
+}
+
+export class AgentAuthenticationError extends Error {
+  constructor(readonly status = 401, message = 'bearer token is required', readonly code = 'unauthorized') {
+    super(message);
+    this.name = 'AgentAuthenticationError';
+  }
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost']);
@@ -130,6 +141,24 @@ function safeEqual(actual: string, expected: string): boolean {
   return left.byteLength === right.byteLength && timingSafeEqual(left, right);
 }
 
+/** Extract one unambiguous host credential from PB's supported headers. */
+export function authTokenFromRequest(req: IncomingMessage): string | undefined {
+  const authorization = req.headers.authorization;
+  const pbHeader = req.headers['x-pb-auth'];
+  const values: string[] = [];
+  for (const value of [authorization, pbHeader]) {
+    if (Array.isArray(value)) throw new AgentAuthenticationError(401, 'multiple authentication headers are not allowed');
+    if (typeof value === 'string' && value.trim()) values.push(value.trim());
+  }
+  if (values.length > 1) {
+    const normalize = (value: string) => value.replace(/^Bearer\s+/i, '').trim();
+    if (normalize(values[0]) !== normalize(values[1])) throw new AgentAuthenticationError(401, 'authentication headers disagree');
+  }
+  const value = values[0];
+  if (!value) return undefined;
+  return value.replace(/^Bearer\s+/i, '').trim() || undefined;
+}
+
 /** Native node:http API for the durable Agent runtime. */
 export function createAgentServer(runtime: AgentRuntime, options: AgentServerOptions = {}): Server {
   const host = options.host ?? '127.0.0.1';
@@ -148,10 +177,20 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
     return tokenMap instanceof Map ? tokenMap.get(token) : tokenMap[token];
   };
 
-  const authenticate = (req: IncomingMessage): AgentPrincipal => {
-    const header = req.headers.authorization;
-    if (typeof header === 'string' && /^Bearer\s+\S+$/i.test(header)) {
-      const token = header.replace(/^Bearer\s+/i, '');
+  const authenticate = async (req: IncomingMessage): Promise<AgentPrincipal> => {
+    if (options.authenticate) {
+      try {
+        if (!authTokenFromRequest(req)) throw new AgentAuthenticationError();
+        const principal = await options.authenticate(req);
+        if (!principal || typeof principal.ownerId !== 'string' || !principal.ownerId.trim()) throw new AgentAuthenticationError();
+        return { ...principal, ownerId: principal.ownerId.trim().toLowerCase() };
+      } catch (error) {
+        if (error instanceof AgentAuthenticationError) throw error;
+        throw new AgentAuthenticationError(401, 'authentication failed');
+      }
+    }
+    const token = authTokenFromRequest(req);
+    if (token) {
       const principal = principalFor(token);
       if (principal?.ownerId) return principal;
       throw new HttpError(401, 'invalid bearer token', 'unauthorized');
@@ -167,8 +206,8 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
   };
 
   const sessionFor = (principal: AgentPrincipal, sessionId: string) => {
-    const session = runtime.getSession(sessionId);
-    if (session.scope.ownerId !== principal.ownerId) throw new HttpError(403, 'session is outside the authenticated scope', 'forbidden');
+    const session = runtime.store.getSession(sessionId);
+    if (!session || session.scope.ownerId !== principal.ownerId) throw new HttpError(404, 'session not found', 'not_found');
     allowCanvas(principal, session.scope.canvasId);
     return session;
   };
@@ -191,7 +230,7 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
       res.statusCode = 204;
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,Last-Event-ID');
+      res.setHeader('Access-Control-Allow-Headers', 'Authorization,X-Pb-Auth,Content-Type,Last-Event-ID');
       res.setHeader('Access-Control-Max-Age', '600');
       res.end();
       return;
@@ -207,9 +246,12 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
       return;
     }
 
-    const principal = authenticate(req);
+    const principal = await authenticate(req);
     if (path[0] === 'settings' && path[1] === 'provider' && path.length <= 3) {
-      if (principal.ownerId !== defaultPrincipal.ownerId || !options.providerSettings) throw new HttpError(403, '无权管理服务配置', 'forbidden');
+      const settingsOwner = options.providerSettingsOwnerId === undefined
+        ? defaultPrincipal.ownerId.trim().toLowerCase()
+        : options.providerSettingsOwnerId.trim().toLowerCase();
+      if (!settingsOwner || principal.ownerId !== settingsOwner || !options.providerSettings) throw new HttpError(403, '无权管理服务配置', 'forbidden');
       try {
         const settings = options.providerSettings;
         if (req.method === 'GET' && path.length === 2) { writeJson(res, 200, settings.read(), origin); return; }
@@ -338,7 +380,19 @@ export function createAgentServer(runtime: AgentRuntime, options: AgentServerOpt
 
   const server = createServer((req, res) => {
     void handler(req, res).catch((error: unknown) => {
-      const normalized = error instanceof HttpError ? error : new HttpError(500, error instanceof Error ? error.message : String(error), 'internal_error');
+      const bridgeStatus = error && typeof error === 'object' && 'status' in error && typeof (error as { status?: unknown }).status === 'number'
+        ? (error as { status: number }).status
+        : undefined;
+      const bridgeCode = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : undefined;
+      const normalized = error instanceof HttpError
+        ? error
+        : error instanceof AgentAuthenticationError
+          ? new HttpError(error.status, error.message, error.code)
+          : bridgeStatus !== undefined && bridgeStatus >= 400 && bridgeStatus < 500
+            ? new HttpError(bridgeStatus, error instanceof Error ? error.message : '业务桥接请求失败', bridgeCode ?? 'bridge_error')
+          : new HttpError(500, error instanceof Error ? error.message : String(error), 'internal_error');
       if (res.headersSent || res.writableEnded) { res.destroy(); return; }
       const origin = typeof req.headers.origin === 'string' && options.corsOrigin === req.headers.origin ? req.headers.origin : undefined;
       writeJson(res, normalized.status, { error: normalized.code, message: normalized.message }, origin);

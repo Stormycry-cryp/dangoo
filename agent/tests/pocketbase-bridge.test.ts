@@ -24,6 +24,12 @@ function fixture(){
  return {invoke,record,routes,event,fail:()=>{failReceipt=true;},txCount:()=>txCount};
 }
 const input={operationId:'change-1',expectedRevision:2,operations:[{type:'update',nodeId:'node1',patch:{prompt:'new'}}]};
+test('PB identity only uses the verified middleware identity',()=>{
+ const f=fixture();const identity=f.routes.get('GET /api/agent-bridge/v1/identity')!;
+ assert.equal(identity(f.event('',{ownerId:'alice'})).status,401);
+ const result=identity(f.event(' Alice@Example.Test ',{ownerId:'bob'}));
+ assert.equal(result.status,200);assert.equal(result.data.ownerId,'alice@example.test');
+});
 test('PB bridge owner check, immutable idempotency receipts and host field preservation',()=>{
  const f=fixture();assert.equal(f.invoke('',input).status,401);assert.equal(f.invoke('bob',input).status,404);
  const success=f.invoke('alice',input);assert.equal(success.status,200);assert.equal(success.data.revision,3);

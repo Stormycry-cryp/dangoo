@@ -3,6 +3,13 @@ routerAdd("POST", "/api/agent-bridge/v1/wallet-quote", function (e) {
   return e.json(503, { error: "WALLET_PRICING_UNAVAILABLE" })
 })
 // Business bridge only. Agent runtime, providers and UI live in the separate dangoo-agent project.
+routerAdd("GET", "/api/agent-bridge/v1/identity", function (e) {
+  // The existing wallet middleware validates the PB token and account status.
+  // Identity must never come from a request body or an unverified JWT payload.
+  var owner = String(e.get("authEmail") || "").trim().toLowerCase()
+  if (!owner) return e.json(401, { error: "AUTH_REQUIRED" })
+  return e.json(200, { ownerId: owner })
+})
 onBootstrap(function (e) {
   e.next()
   require(__hooks + "/lib/agent-jobs.cjs").bootstrap()

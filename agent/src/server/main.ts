@@ -1,14 +1,14 @@
-import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ContextManager } from '../context/index.js';
-import { LocalCanvasGateway, HttpDangooGateway, UnavailableAssetGateway, createCanvasTools } from '../adapters/index.js';
+import { LocalCanvasGateway, OwnerScopedHttpDangooGateway, UnavailableAssetGateway, createCanvasTools } from '../adapters/index.js';
 import { AgentRuntime } from '../core/runtime.js';
 import { SqliteStore } from '../core/store.js';
 import { ToolRegistry } from '../core/tool-registry.js';
 import { ProviderRegistry, OpenAICompatibleProvider } from '../providers/index.js';
 import { SkillRegistry, type SkillRootSpec } from '../skills/index.js';
-import { createAgentServer, listenAgentServer, type AgentServerOptions } from './server.js';
+import { AgentAuthenticationError, authTokenFromRequest, createAgentServer, listenAgentServer, type AgentServerOptions } from './server.js';
 import type { AssetGateway, CanvasGateway, Scope } from '../contracts/index.js';
 import { ProviderSettingsManager } from './provider-settings.js';
 import { createNodeApprovalPolicy } from './node-approval.js';
@@ -40,6 +40,36 @@ function skillRoots(value: string): SkillRootSpec[] {
 }
 
 /**
+ * Resolve the package-owned Skill root from the module location. The source
+ * entrypoint lives at src/server/main.ts while the built server lives at
+ * dist/runtime/server/main.js; neither location depends on the caller's cwd.
+ */
+function builtinSkillRoot(): string {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const sourceRoot = resolve(moduleDir, '../../skills');
+  const builtRoot = resolve(moduleDir, '../../../skills');
+  if (existsSync(sourceRoot)) return sourceRoot;
+  if (existsSync(builtRoot)) return builtRoot;
+  // Keep the expected package path in the error when a checkout is missing
+  // its built-in packages instead of silently starting with an empty catalog.
+  return moduleDir.endsWith(join('dist', 'runtime', 'server')) ? builtRoot : sourceRoot;
+}
+
+async function loadSkills(): Promise<SkillRegistry> {
+  const roots: SkillRootSpec[] = [
+    { path: builtinSkillRoot(), scope: 'builtin', id: 'builtin' },
+    ...skillRoots(env('AGENT_SKILL_ROOTS')),
+  ];
+  const skills = new SkillRegistry({ roots });
+  const discovery = await skills.discover();
+  if (discovery.errors.length > 0) {
+    const details = discovery.errors.map((error) => `${error.path}: ${error.message}`).join('; ');
+    throw new Error(`Skill discovery failed: ${details}`);
+  }
+  return skills;
+}
+
+/**
  * Build the real environment wiring. There is intentionally no mock provider:
  * an absent GLM key leaves health configured=false and message requests return
  * 503 until a credential is supplied.
@@ -47,12 +77,15 @@ function skillRoots(value: string): SkillRootSpec[] {
 export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
   const dataDir = env('AGENT_DATA_DIR', './data');
   mkdirSync(dataDir, { recursive: true });
-  const ownerId = env('AGENT_OWNER_ID', 'local-user');
+  const configuredOwnerId = env('AGENT_OWNER_ID');
+  const ownerId = configuredOwnerId || 'local-user';
   const canvasId = env('AGENT_CANVAS_ID', 'demo-canvas');
   const scope: Scope = { ownerId, canvasId };
   const canvasMode = env('AGENT_CANVAS_MODE', 'http').toLowerCase();
   let canvas: CanvasGateway;
   let assets: AssetGateway;
+  let authenticateBridge: AgentServerOptions['authenticate'];
+  let syncBridgeTools: () => void = () => {};
   let isolatedWorkbench = false;
   if (canvasMode === 'local') {
     const local = new LocalCanvasGateway(join(dataDir, 'canvas-workbench.sqlite'));
@@ -62,13 +95,26 @@ export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
     isolatedWorkbench = true;
   } else if (canvasMode === 'http') {
     const baseUrl = env('DANGOO_BRIDGE_URL');
-    const bridgeToken = env('DANGOO_AUTH_TOKEN');
-    if (!baseUrl || !bridgeToken) throw new Error('AGENT_CANVAS_MODE=http requires DANGOO_BRIDGE_URL and DANGOO_AUTH_TOKEN');
+    if (!baseUrl) throw new Error('AGENT_CANVAS_MODE=http requires DANGOO_BRIDGE_URL');
     const authHeader = env('DANGOO_AUTH_HEADER', 'Authorization');
     if (authHeader !== 'Authorization' && authHeader !== 'X-Pb-Auth') throw new Error('DANGOO_AUTH_HEADER must be Authorization or X-Pb-Auth');
-    const bridge = await HttpDangooGateway.connect({ baseUrl, scope, tokenFor: async () => bridgeToken, authHeader });
+    const bridge = new OwnerScopedHttpDangooGateway({ baseUrl, authHeader });
     canvas = bridge;
     assets = bridge;
+    authenticateBridge = async (request) => {
+      const token = authTokenFromRequest(request);
+      if (!token) throw new AgentAuthenticationError(401, 'bearer token is required');
+      try {
+        const authenticatedOwner = await bridge.authenticate(token);
+        syncBridgeTools();
+        return { ownerId: authenticatedOwner };
+      } catch (error) {
+        const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : '';
+        if (code === 'AUTH_REQUIRED' || code === 'AUTH_INVALID') throw new AgentAuthenticationError(401, 'authentication failed');
+        if (code === 'AUTH_FORBIDDEN') throw new AgentAuthenticationError(403, 'account is not allowed', 'forbidden');
+        throw new AgentAuthenticationError(503, 'identity service unavailable', 'identity_unavailable');
+      }
+    };
   } else {
     throw new Error(`Unknown AGENT_CANVAS_MODE: ${canvasMode}; expected local or http`);
   }
@@ -94,9 +140,18 @@ export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
   const providers = new ProviderRegistry([provider]);
   const providerSettings = new ProviderSettingsManager(join(dataDir, 'provider-settings.json'), { providerId, model, baseUrl: providerBaseUrl, apiKey }, providers, provider.capabilities(model));
   if (providerSettings.configured) providers.upsert(providerSettings.provider());
-  const skills = new SkillRegistry({ roots: skillRoots(env('AGENT_SKILL_ROOTS')) });
-  if (env('AGENT_SKILL_ROOTS')) await skills.discover();
-  const tools = new ToolRegistry(createCanvasTools(canvas, assets));
+  const skills = await loadSkills();
+  const tools = new ToolRegistry(canvasMode === 'http' ? [] : createCanvasTools(canvas, assets));
+  let installedBridgeRevision = canvasMode === 'http' ? '' : canvas.capabilities().revision;
+  syncBridgeTools = () => {
+    if (canvasMode !== 'http') return;
+    const revision = canvas.capabilities().revision;
+    if (!revision || revision === 'pending' || revision === installedBridgeRevision) return;
+    const definitions = createCanvasTools(canvas, assets);
+    for (const existing of tools.list()) tools.unregister(existing.name);
+    for (const definition of definitions) tools.register(definition);
+    installedBridgeRevision = revision;
+  };
   const store = new SqliteStore(join(dataDir, 'agent.sqlite'));
   const runtime = new AgentRuntime({
     store, providers, tools, skills, context: new ContextManager(), canvas, assets, model,
@@ -120,12 +175,14 @@ export async function createEnvironmentRuntime(): Promise<EnvironmentRuntime> {
     port: numberEnv('AGENT_PORT', 4317, 1, 65_535),
     bearerToken: env('AGENT_TOKEN') || undefined,
     defaultPrincipal: { ownerId, ...(isolatedWorkbench ? { canvasIds: [canvasId] } : {}) },
+    ...(authenticateBridge ? { authenticate: authenticateBridge, requireAuth: true, allowUnauthenticatedLocal: false } : {}),
+    providerSettingsOwnerId: canvasMode === 'http' ? configuredOwnerId : ownerId,
     configured: () => providerSettings.configured,
     providerSettings,
     canvas,
   };
   const server = createAgentServer(runtime, serverOptions);
-  const jobsTimer = canvas.capabilities().jobs ? setInterval(() => { void runtime.pollJobs(); }, 3000) : undefined;
+  const jobsTimer = canvasMode === 'http' || canvas.capabilities().jobs ? setInterval(() => { void runtime.pollJobs(); }, 3000) : undefined;
   jobsTimer?.unref();
   return {
     runtime,

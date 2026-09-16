@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx --env-file-if-exists=.env src/server/main.ts",
+    "dev:mock": "tsx scripts/mock-agent.ts",
     "dev:ui": "vite --host 127.0.0.1",
     "build": "npm run typecheck && npm run build:server && npm run build:ui && npm run build:widget && npm run build:bridge",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
+    "smoke:mock": "tsx scripts/mock-smoke.ts",
     "check": "npm run typecheck && npm test && npm run build",
     "build:server": "tsc -p tsconfig.server.json",
     "build:ui": "vite build",

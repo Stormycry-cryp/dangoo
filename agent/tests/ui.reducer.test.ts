@@ -23,6 +23,35 @@ test('leaving a canvas during host save cannot send a deferred message', async (
   assert.equal(sends, 0);
 });
 
+test('retry reuses the selected skill names from the failed request', async () => {
+  const session = { id: 'skill-session', scope: { canvasId: 'skill-canvas' }, createdAt: 1 };
+  const skillNames = ['fashion-ecommerce-image-set'];
+  const sentSkills: string[][] = [];
+  let attempts = 0;
+  const client: AgentClientLike = {
+    health: async () => ({}),
+    capabilities: async () => ({ skills: [] }),
+    createSession: async () => ({ session }),
+    getSession: async () => ({ session, messages: [], events: [], eventSequence: 0 }),
+    sendMessage: async (_sessionId, input) => {
+      sentSkills.push([...(input.skillNames ?? [])]);
+      attempts += 1;
+      if (attempts === 1) throw new Error('第一次发送失败');
+      return {};
+    },
+    streamEvents: async () => (async function* () {})(),
+    stopRun: async () => ({}),
+    replyRun: async () => ({}),
+    compact: async () => ({}),
+    listSessions: async () => ({ sessions: [] }),
+  };
+  const store = createAgentStore({ client, canvasId: 'skill-canvas', hostBridge: { contractVersion: '1.0.0', canvasId: 'skill-canvas', getSelection: () => ({ nodeIds: [], assets: [] }), locateNode() {}, previewAsset() {} } });
+  await store.sendMessage('生成服装详情页', skillNames);
+  await store.retryLastMessage();
+  assert.deepEqual(sentSkills, [skillNames, skillNames]);
+  store.destroy();
+});
+
 test('canonical session initialization shares one request and restores durable history', async () => {
   let creates = 0;
   let reads = 0;
@@ -78,6 +107,64 @@ test('accepted user events reconcile only their pending run, preserving repeated
   }));
   assert.deepEqual(state.messages.map((message) => message.id), ['optimistic-1', 'server-2']);
   assert.equal(state.messages[1]?.pending, false);
+});
+
+test('accepted SSE event reconciles the optimistic row when it beats POST response', () => {
+  let state = reduceAgentStore(baseState, {
+    type: 'message.added',
+    message: { id: 'optimistic-stop', role: 'user', text: 'mock:stop', attachments: [], createdAt: 1, requestId: 'request-stop', pending: true },
+  });
+  state = applyAgentEvent(state, event(1, 'message.accepted', {
+    runId: 'run-stop',
+    requestId: 'request-stop',
+    message: { id: 'server-stop', role: 'user', content: [{ type: 'text', text: 'mock:stop' }], createdAt: 2 },
+  }));
+  assert.equal(state.messages.length, 1);
+  assert.equal(state.messages[0]?.id, 'server-stop');
+  assert.equal(state.messages[0]?.runId, 'run-stop');
+  assert.equal(state.messages[0]?.pending, false);
+
+  state = reduceAgentStore(state, { type: 'message.linked', id: 'server-stop', runId: 'run-stop', requestId: 'request-stop' });
+  assert.equal(state.messages.length, 1);
+  assert.equal(state.messages[0]?.pending, false);
+});
+
+test('accepted events do not collapse a real repeated user message by text', () => {
+  let state = reduceAgentStore(baseState, {
+    type: 'message.added',
+    message: { id: 'server-first', role: 'user', text: 'mock:stop', attachments: [], createdAt: 1, runId: 'run-first', pending: false },
+  });
+  state = reduceAgentStore(state, {
+    type: 'message.added',
+    message: { id: 'optimistic-second', role: 'user', text: 'mock:stop', attachments: [], createdAt: 2, requestId: 'request-second', pending: true },
+  });
+  state = applyAgentEvent(state, event(1, 'message.accepted', {
+    runId: 'run-second',
+    requestId: 'request-second',
+    message: { id: 'server-second', role: 'user', content: [{ type: 'text', text: 'mock:stop' }], createdAt: 3 },
+  }));
+  assert.deepEqual(state.messages.map((message) => message.id), ['server-first', 'server-second']);
+  assert.deepEqual(state.messages.map((message) => message.text), ['mock:stop', 'mock:stop']);
+});
+
+test('requestId keeps concurrent accepted events on the correct optimistic row', () => {
+  let state = reduceAgentStore(baseState, {
+    type: 'message.added',
+    message: { id: 'optimistic-a', role: 'user', text: '同样的指令', attachments: [], createdAt: 1, runId: 'run-b', requestId: 'request-a', pending: true },
+  });
+  state = reduceAgentStore(state, {
+    type: 'message.added',
+    message: { id: 'optimistic-b', role: 'user', text: '同样的指令', attachments: [], createdAt: 2, requestId: 'request-b', pending: true },
+  });
+  state = applyAgentEvent(state, event(1, 'message.accepted', {
+    runId: 'run-b',
+    requestId: 'request-b',
+    message: { id: 'server-b', role: 'user', content: [{ type: 'text', text: '同样的指令' }], createdAt: 3 },
+  }));
+  assert.deepEqual(state.messages.map((message) => message.id), ['optimistic-a', 'server-b']);
+  assert.equal(state.messages[0]?.pending, true);
+  assert.equal(state.messages[0]?.requestId, 'request-a');
+  assert.equal(state.messages[1]?.requestId, 'request-b');
 });
 
 test('session list parsing filters by canvas and understands scope.canvasId', () => {

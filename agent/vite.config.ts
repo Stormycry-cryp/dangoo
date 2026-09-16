@@ -2,6 +2,9 @@ import { defineConfig } from 'vite';
 import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig(({ mode }) => ({
+  // Library builds leave process.env untouched by default. This standalone
+  // browser module must bundle React's production branch without a Node shim.
+  ...(mode === 'widget' ? { define: { 'process.env.NODE_ENV': JSON.stringify('production') } } : {}),
   server: {
     host: '127.0.0.1',
     port: 5173,

@@ -160,13 +160,22 @@ function upsertAsset(items: AssetCardData[], value: AssetCardData): AssetCardDat
 }
 
 function addOrMergeMessage(messages: ChatMessage[], message: ChatMessage): ChatMessage[] {
-  const index = messages.findIndex((item) => item.id === message.id || (
-    item.role === 'user' && message.role === 'user' && item.pending === true &&
-    ((message.runId && item.runId === message.runId) || (message.requestId && item.requestId === message.requestId)) &&
-    (!message.text || item.text === message.text)
-  ) || (
-    item.role === 'assistant' && message.role === 'assistant' && item.streaming === true && message.runId !== undefined && item.runId === message.runId
-  ));
+  const exactId = messages.findIndex((item) => item.id === message.id);
+  let index = exactId;
+  if (index < 0 && message.role === 'user' && message.requestId) {
+    // A requestId is the durable client/server idempotency key. Prefer it over
+    // runId because multiple supplemental messages may share one active run.
+    index = messages.findIndex((item) => item.role === 'user' && item.pending === true && item.requestId === message.requestId && (!message.text || item.text === message.text));
+  }
+  if (index < 0) {
+    index = messages.findIndex((item) => (
+      item.role === 'user' && message.role === 'user' && item.pending === true &&
+      message.runId !== undefined && item.runId === message.runId &&
+      (!message.text || item.text === message.text)
+    ) || (
+      item.role === 'assistant' && message.role === 'assistant' && item.streaming === true && message.runId !== undefined && item.runId === message.runId
+    ));
+  }
   if (index < 0) return [...messages, message];
   const next = messages.slice();
   next[index] = {
@@ -214,7 +223,8 @@ export function applyAgentEvent(state: AgentStoreState, event: AgentEventView): 
       const candidate = messageFromUnknown(data.message ?? data, stringValue(data.messageId) ?? `user:${event.sequence}`);
       if (candidate) {
         const runId = stringValue(data.runId);
-        next.messages = addOrMergeMessage(next.messages, { ...candidate, ...(runId ? { runId } : {}), pending: false });
+        const requestId = stringValue(data.requestId);
+        next.messages = addOrMergeMessage(next.messages, { ...candidate, ...(runId ? { runId } : {}), ...(requestId ? { requestId } : {}), pending: false });
       }
       break;
     }
@@ -321,7 +331,7 @@ export function reduceAgentStore(state: AgentStoreState, action: AgentStoreActio
       return {
         ...state,
         messages: state.messages.map((message) => message.id === action.id
-          ? { ...message, runId: action.runId, ...(action.requestId ? { requestId: action.requestId } : {}), pending: true }
+          ? { ...message, runId: action.runId, ...(action.requestId ? { requestId: action.requestId } : {}), pending: message.pending === false ? false : true }
           : message),
       };
     case 'message.delta': {
@@ -702,7 +712,8 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
       }
       dispatch({ type: 'error.changed', error: undefined });
       state = { ...state, lastSentText: trimmed, lastSentSelection: selection };
-      const response = await options.client.sendMessage(sessionId, { text: trimmed, selection, ...(skillNames?.length ? { skillNames } : {}) }, requestId);
+      const frozenSkillNames = skillNames?.length ? [...skillNames] : skillNames;
+      const response = await options.client.sendMessage(sessionId, { text: trimmed, selection, ...(frozenSkillNames?.length ? { skillNames: frozenSkillNames } : {}) }, requestId);
       const source = recordValue(response) ?? {};
       const run = runFromUnknown(source.run ?? source, sessionId);
       if (run) {
@@ -713,7 +724,7 @@ export function createAgentStore(options: AgentStoreOptions): AgentStore {
       retryRequest = undefined;
       startEvents(sessionId);
     } catch (error) {
-      if (frozenSelection) retryRequest = { text: trimmed, selection: frozenSelection, requestId, skillNames };
+      if (frozenSelection) retryRequest = { text: trimmed, selection: frozenSelection, requestId, skillNames: skillNames ? [...skillNames] : undefined };
       dispatch({ type: 'error.changed', error: error instanceof Error ? error.message : '发送失败，请重试' });
       const last = optimisticMessageId ? state.messages.find((message) => message.id === optimisticMessageId) : undefined;
       if (last) dispatch({ type: 'message.added', message: { ...last, failed: true, pending: false } });

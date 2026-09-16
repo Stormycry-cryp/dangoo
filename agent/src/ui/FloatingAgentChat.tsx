@@ -13,6 +13,7 @@ import {
 } from 'react';
 import { AgentClient } from './client';
 import { ProviderSettings } from './ProviderSettings';
+import type { SkillMetadata } from '../contracts/index';
 import type { ProviderSettingsView } from './types';
 import { createAgentStore } from './store';
 import type {
@@ -26,6 +27,7 @@ import type {
   ToolStep,
 } from './types';
 import { assetKey, safeHttpUrl } from './types';
+import { enabledSkillsFromCapabilities, filterSkills, parseSlashSkillInvocation, replaceSlashSkillInvocation } from './skills';
 
 function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true };
@@ -249,6 +251,61 @@ function WaitCard({ input, onReply }: { input: PendingInput; onReply: (text: str
   </section>;
 }
 
+type SkillCatalogState = 'idle' | 'loading' | 'ready' | 'error';
+
+function SkillChip({ skill, onRemove }: { skill: SkillMetadata; onRemove: () => void }) {
+  return <span className="agent-skill-chip" title={skill.description}>
+    <span className="agent-skill-chip__slash">/</span>
+    <span className="agent-skill-chip__name">{skill.name}</span>
+    <button type="button" className="agent-icon-button agent-icon-button--tiny" onClick={onRemove} aria-label={`移除技能 ${skill.name}`}><Icon name="close" size={11} /></button>
+  </span>;
+}
+
+interface SkillPickerProps {
+  open: boolean;
+  skills: readonly SkillMetadata[];
+  filteredSkills: readonly SkillMetadata[];
+  selectedNames: ReadonlySet<string>;
+  query: string;
+  status: SkillCatalogState;
+  error?: string;
+  highlightedIndex: number;
+  searchRef: (element: HTMLInputElement | null) => void;
+  onToggle: () => void;
+  onQueryChange: (value: string) => void;
+  onKeyDown: (event: KeyboardEvent<HTMLInputElement>) => void;
+  onSelect: (skill: SkillMetadata) => void;
+  onRetry: () => void;
+}
+
+function SkillPicker({ open, skills, filteredSkills, selectedNames, query, status, error, highlightedIndex, searchRef, onToggle, onQueryChange, onKeyDown, onSelect, onRetry }: SkillPickerProps) {
+  return <div className="agent-skill-picker">
+    <button type="button" className={`agent-tool-button agent-skill-trigger${open ? ' agent-skill-trigger--active' : ''}`} onClick={onToggle} aria-haspopup="listbox" aria-expanded={open} aria-label="选择技能">
+      <span className="agent-skill-trigger__slash">/</span><span>技能</span>{selectedNames.size ? <span className="agent-skill-trigger__count">{selectedNames.size}</span> : null}
+    </button>
+    {open ? <div className="agent-skill-popover" role="dialog" aria-label="选择技能">
+      <div className="agent-skill-search">
+        <span className="agent-skill-search__slash">/</span>
+        <input ref={searchRef} value={query} onChange={(event) => onQueryChange(event.target.value)} onKeyDown={onKeyDown} placeholder="搜索技能" aria-label="搜索技能" aria-controls="agent-skill-options" />
+        {query ? <button type="button" className="agent-icon-button agent-icon-button--tiny" onClick={() => onQueryChange('')} aria-label="清除技能搜索"><Icon name="close" size={11} /></button> : null}
+      </div>
+      {status === 'loading' && !skills.length ? <div className="agent-skill-state"><span className="agent-spinner" />正在读取技能目录</div> : null}
+      {status === 'error' ? <div className="agent-skill-state agent-skill-state--error"><span>{error ?? '无法读取技能目录'}</span><button type="button" className="agent-text-button" onClick={onRetry}><Icon name="refresh" size={11} />重试</button></div> : null}
+      {status === 'ready' && !skills.length ? <div className="agent-skill-state"><span>暂无已启用技能</span><small>目录中的禁用技能不会显示</small></div> : null}
+      {status === 'ready' && skills.length > 0 && !filteredSkills.length ? <div className="agent-skill-state"><span>未找到匹配技能</span><small>试试其他名称或关键词</small></div> : null}
+      {filteredSkills.length > 0 ? <div id="agent-skill-options" className="agent-skill-options" role="listbox" aria-label="可用技能">
+        {filteredSkills.map((skill, index) => {
+          const selected = selectedNames.has(skill.name);
+          return <button type="button" role="option" aria-selected={selected} key={`${skill.name}:${skill.revision}`} className={`agent-skill-option${index === highlightedIndex ? ' agent-skill-option--highlighted' : ''}${selected ? ' agent-skill-option--selected' : ''}`} onClick={() => onSelect(skill)}>
+            <span className="agent-skill-option__copy"><strong>{skill.name}</strong><small>{skill.description}</small></span>
+            {selected ? <Icon name="check" size={13} /> : <span className="agent-skill-option__enter">Enter</span>}
+          </button>;
+        })}
+      </div> : null}
+    </div> : null}
+  </div>;
+}
+
 function StatusLine({ state, serviceState, providerName, model }: { state: ReturnType<AgentStore['getState']>; serviceState?: FloatingAgentChatProps['serviceState']; providerName?: string; model?: string }) {
   const active = state.activeRunId ? state.runs[state.activeRunId] : undefined;
   const transportState = state.connection === 'idle' || state.connection === 'connected' ? undefined : state.connection;
@@ -287,10 +344,21 @@ export function FloatingAgentChat({
   const [localNotice, setLocalNotice] = useState<string>();
   const [composerFocused, setComposerFocused] = useState(false);
   const [composing, setComposing] = useState(false);
+  const [skillCatalog, setSkillCatalog] = useState<SkillMetadata[]>([]);
+  const [skillCatalogState, setSkillCatalogState] = useState<SkillCatalogState>('idle');
+  const [skillCatalogError, setSkillCatalogError] = useState<string>();
+  const [selectedSkills, setSelectedSkills] = useState<SkillMetadata[]>([]);
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  const [skillQuery, setSkillQuery] = useState('');
+  const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const skillSearchRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const previousMessageCount = useRef(0);
+  const composerCursorRef = useRef(0);
+  const dismissedSlashDraftRef = useRef<string | undefined>(undefined);
+  const skillCatalogRequestRef = useRef(0);
 
   useEffect(() => {
     store.resume();
@@ -301,6 +369,32 @@ export function FloatingAgentChat({
   useEffect(() => {
     if (initialAttachments?.length) initialAttachments.forEach((attachment) => store.addAttachment(attachment));
   }, [initialAttachments, store]);
+  const refreshSkillCatalog = useCallback(async () => {
+    const requestId = ++skillCatalogRequestRef.current;
+    setSkillCatalogState('loading');
+    setSkillCatalogError(undefined);
+    try {
+      const capabilities = await resolvedClient.capabilities();
+      if (requestId !== skillCatalogRequestRef.current) return;
+      setSkillCatalog(enabledSkillsFromCapabilities(capabilities));
+      setSkillCatalogState('ready');
+    } catch (error) {
+      if (requestId !== skillCatalogRequestRef.current) return;
+      setSkillCatalogState('error');
+      setSkillCatalogError(error instanceof Error ? error.message : '无法读取技能目录');
+    }
+  }, [resolvedClient]);
+  useEffect(() => {
+    setSelectedSkills([]);
+    setSkillPickerOpen(false);
+    setSkillQuery('');
+    setHighlightedSkillIndex(0);
+    dismissedSlashDraftRef.current = undefined;
+    composerCursorRef.current = 0;
+  }, [canvasId]);
+  useEffect(() => {
+    void refreshSkillCatalog();
+  }, [refreshSkillCatalog, canvasId]);
   useEffect(() => {
     if (!configured) return;
     let active = true;
@@ -312,6 +406,9 @@ export function FloatingAgentChat({
   useEffect(() => {
     if (isOpen) requestAnimationFrame(() => composerRef.current?.focus());
   }, [isOpen]);
+  useEffect(() => {
+    composerCursorRef.current = state.draft.length;
+  }, [state.draft]);
   useLayoutEffect(() => {
     const element = conversationRef.current;
     if (!element) return;
@@ -333,16 +430,124 @@ export function FloatingAgentChat({
     }
   };
 
+  const activeSlashInvocation = parseSlashSkillInvocation(state.draft, composerCursorRef.current);
+  const activeSkillQuery = activeSlashInvocation?.query ?? skillQuery;
+  const filteredSkills = useMemo(() => filterSkills(skillCatalog, activeSkillQuery), [activeSkillQuery, skillCatalog]);
+  const selectedSkillNames = useMemo(() => new Set(selectedSkills.map((skill) => skill.name)), [selectedSkills]);
+
+  const focusSkillSearch = useCallback(() => {
+    requestAnimationFrame(() => {
+      skillSearchRef.current?.focus();
+      skillSearchRef.current?.select();
+    });
+  }, []);
+
+  const toggleSkillPicker = useCallback(() => {
+    setSkillPickerOpen((current) => {
+      const next = !current;
+      if (next) focusSkillSearch();
+      return next;
+    });
+  }, [focusSkillSearch]);
+
+  const selectSkill = useCallback((skill: SkillMetadata) => {
+    setSelectedSkills((current) => current.some((item) => item.name === skill.name)
+      ? current.filter((item) => item.name !== skill.name)
+      : [...current, skill]);
+    if (activeSlashInvocation) {
+      const nextDraft = replaceSlashSkillInvocation(state.draft, activeSlashInvocation, '');
+      composerCursorRef.current = activeSlashInvocation.start;
+      store.setDraft(nextDraft);
+    }
+    setSkillPickerOpen(false);
+    setSkillQuery('');
+    dismissedSlashDraftRef.current = undefined;
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }, [activeSlashInvocation, state.draft, store]);
+
+  const removeSkill = useCallback((name: string) => {
+    setSelectedSkills((current) => current.filter((skill) => skill.name !== name));
+  }, []);
+
+  const onSkillQueryChange = useCallback((value: string) => {
+    if (activeSlashInvocation) {
+      const nextDraft = replaceSlashSkillInvocation(state.draft, activeSlashInvocation, `/${value}`);
+      composerCursorRef.current = activeSlashInvocation.start + value.length + 1;
+      store.setDraft(nextDraft);
+    } else {
+      setSkillQuery(value);
+    }
+    setHighlightedSkillIndex(0);
+    dismissedSlashDraftRef.current = undefined;
+  }, [activeSlashInvocation, state.draft, store]);
+
+  const onSkillPickerKeyDown = useCallback((event: KeyboardEvent<HTMLInputElement>) => {
+    event.stopPropagation();
+    if (event.nativeEvent.isComposing) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!filteredSkills.length) return;
+      setHighlightedSkillIndex((current) => event.key === 'ArrowDown'
+        ? (current + 1) % filteredSkills.length
+        : (current - 1 + filteredSkills.length) % filteredSkills.length);
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const skill = filteredSkills[highlightedSkillIndex];
+      if (skill) selectSkill(skill);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setSkillPickerOpen(false);
+      dismissedSlashDraftRef.current = state.draft;
+      composerRef.current?.focus();
+    }
+  }, [filteredSkills, highlightedSkillIndex, selectSkill, state.draft]);
+
   const sendDraft = useCallback(async () => {
     if (!state.draft.trim() || !configured || attachmentBusy) return;
-    await store.sendMessage(state.draft);
-  }, [attachmentBusy, configured, state.draft, store]);
+    await store.sendMessage(state.draft, selectedSkills.map((skill) => skill.name));
+  }, [attachmentBusy, configured, selectedSkills, state.draft, store]);
 
   const onComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     event.stopPropagation();
+    if (event.nativeEvent.isComposing || composing) return;
+    if (skillPickerOpen && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+      event.preventDefault();
+      if (!filteredSkills.length) return;
+      setHighlightedSkillIndex((current) => event.key === 'ArrowDown'
+        ? (current + 1) % filteredSkills.length
+        : (current - 1 + filteredSkills.length) % filteredSkills.length);
+      return;
+    }
+    if (skillPickerOpen && event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      const skill = filteredSkills[highlightedSkillIndex];
+      if (skill) selectSkill(skill);
+      return;
+    }
+    if (skillPickerOpen && event.key === 'Escape') {
+      event.preventDefault();
+      setSkillPickerOpen(false);
+      dismissedSlashDraftRef.current = state.draft;
+      return;
+    }
     if (event.key === 'Enter' && !event.shiftKey && !composing) {
       event.preventDefault();
       void sendDraft();
+    }
+  };
+
+  const onComposerDraftChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const value = event.target.value;
+    composerCursorRef.current = event.target.selectionStart ?? value.length;
+    store.setDraft(value);
+    const invocation = parseSlashSkillInvocation(value, composerCursorRef.current);
+    if (invocation && dismissedSlashDraftRef.current !== value) {
+      setSkillPickerOpen(true);
+      setHighlightedSkillIndex(0);
     }
   };
 
@@ -422,10 +627,10 @@ export function FloatingAgentChat({
       {!state.nearBottom && state.unreadCount > 0 ? <button type="button" className="agent-unread" onClick={() => { store.setNearBottom(true); conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight, behavior: 'smooth' }); }}><span>{state.unreadCount} 条新内容</span><Icon name="chevron" size={13} /></button> : null}
     </div>
     <div className={`agent-composer${composerFocused ? ' agent-composer--focused' : ''}`}>
-      {state.attachments.length ? <div className="agent-composer__attachments" aria-label="当前引用">{state.attachments.map((attachment) => <AttachmentPill key={assetKey(attachment.ref)} attachment={attachment} onRemove={() => store.removeAttachment(attachment.ref)} />)}</div> : null}
+      {state.attachments.length || selectedSkills.length ? <div className="agent-composer__attachments" aria-label="当前引用">{state.attachments.map((attachment) => <AttachmentPill key={assetKey(attachment.ref)} attachment={attachment} onRemove={() => store.removeAttachment(attachment.ref)} />)}{selectedSkills.map((skill) => <SkillChip key={skill.name} skill={skill} onRemove={() => removeSkill(skill.name)} />)}</div> : null}
       {localNotice ? <div className="agent-composer__notice" role="status">{localNotice}</div> : null}
-      <textarea ref={composerRef} value={state.draft} onChange={(event) => store.setDraft(event.target.value)} onKeyDown={onComposerKeyDown} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onFocus={() => setComposerFocused(true)} onBlur={() => setComposerFocused(false)} placeholder={activeRun ? '补充当前任务…' : '描述你想做的作品…'} rows={3} aria-label="给 Agent 的消息" />
-      <div className="agent-composer__footer"><div className="agent-composer__tools"><button type="button" className="agent-tool-button" onClick={() => fileInputRef.current?.click()} disabled={attachmentBusy} aria-label="添加附件"><Icon name="paperclip" size={14} />{attachmentBusy ? '登记中' : '附件'}</button><input ref={fileInputRef} type="file" className="agent-file-input" accept="image/*,video/*,audio/*" onChange={onFileChange} /><button type="button" className="agent-tool-button" onClick={() => void store.compact()} disabled={!state.session || state.compacting} aria-label="整理对话上下文"><Icon name="layers" size={14} />整理</button></div><div className="agent-composer__actions">{canStop ? <button type="button" className="agent-stop-button" onClick={() => void store.stopActiveRun()}><Icon name="stop" size={13} />停止</button> : null}<button type="button" className="agent-send-button" onClick={() => void sendDraft()} disabled={!state.draft.trim() || !configured || attachmentBusy} aria-label={activeRun ? '补充消息' : '发送消息'}><span>{activeRun ? '补充' : '发送'}</span><Icon name="send" size={14} /></button></div></div>
+      <textarea ref={composerRef} value={state.draft} onChange={onComposerDraftChange} onKeyDown={onComposerKeyDown} onSelect={(event) => { composerCursorRef.current = event.currentTarget.selectionStart ?? state.draft.length; }} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onFocus={() => setComposerFocused(true)} onBlur={() => setComposerFocused(false)} placeholder={activeRun ? '补充当前任务…' : '描述你想做的作品…'} rows={3} aria-label="给 Agent 的消息" />
+      <div className="agent-composer__footer"><div className="agent-composer__tools"><button type="button" className="agent-tool-button" onClick={() => fileInputRef.current?.click()} disabled={attachmentBusy} aria-label="添加附件"><Icon name="paperclip" size={14} />{attachmentBusy ? '登记中' : '附件'}</button><input ref={fileInputRef} type="file" className="agent-file-input" accept="image/*,video/*,audio/*" onChange={onFileChange} /><button type="button" className="agent-tool-button" onClick={() => void store.compact()} disabled={!state.session || state.compacting} aria-label="整理对话上下文"><Icon name="layers" size={14} />整理</button><SkillPicker open={skillPickerOpen} skills={skillCatalog} filteredSkills={filteredSkills} selectedNames={selectedSkillNames} query={activeSkillQuery} status={skillCatalogState} error={skillCatalogError} highlightedIndex={highlightedSkillIndex} searchRef={(element) => { skillSearchRef.current = element; }} onToggle={toggleSkillPicker} onQueryChange={onSkillQueryChange} onKeyDown={onSkillPickerKeyDown} onSelect={selectSkill} onRetry={() => void refreshSkillCatalog()} /></div><div className="agent-composer__actions">{canStop ? <button type="button" className="agent-stop-button" onClick={() => void store.stopActiveRun()}><Icon name="stop" size={13} />停止</button> : null}<button type="button" className="agent-send-button" onClick={() => void sendDraft()} disabled={!state.draft.trim() || !configured || attachmentBusy} aria-label={activeRun ? '补充消息' : '发送消息'}><span>{activeRun ? '补充' : '发送'}</span><Icon name="send" size={14} /></button></div></div>
     </div>
   </aside>;
 }
