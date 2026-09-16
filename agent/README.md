@@ -2,6 +2,8 @@
 
 面向节点画布创作的独立 Agent。Node.js + TypeScript + SQLite，运行时不依赖 Codex。采用 Codex 的核心机制改写，源码与行为对应关系见 [source-map.md](docs/source-map.md)。
 
+当前交付边界、生产配置、待对接及验收事项见 [Agent 对接与注意事项](docs/integration-handoff.md)。
+
 ## 在现有画布中启用
 
 产品入口是宿主现有 `/canvas/:id` 页面中的固定悬浮框。`agent/` 是可独立构建和维护的代码包；无新增 Agent 产品模式或画布路由。
@@ -23,7 +25,7 @@ npm run dev
 
 在原画布页面使用右下角 Agent。原应用的 Vite 开发代理将 `/agent-api` 转发到本机 `4317`；生产需要相同路径的反向代理。`npm run build` 会构建 Agent runtime 和 widget，并将 widget 放入原应用的 `public/agent/`，最终随原应用静态产物发布。Provider 密钥仅在 Agent 服务端读取。
 
-当前服务入口按单用户、指定画布的本机联调配置。多用户部署需由可信认证入口提供用户与画布权限，并按主体选择业务凭据；不能把固定测试用户的服务直接开放到公网。`AGENT_TOKEN` 仅用于 Agent 服务认证，与 Provider 密钥不同。
+当前服务入口按单业务账号配置，HTTP 模式支持该账号有权限的多个画布。多用户部署需由可信认证入口提供用户与画布权限，并按主体选择业务凭据；不能把固定测试用户的服务直接开放到公网。`AGENT_TOKEN` 仅用于 Agent 服务认证，与 Provider 密钥不同。
 
 GLM-5.3-Flash 的真实流式工具调用已验证。没有密钥时显示未配置，不自动替换模拟模型。模型视觉输入和账户上下文限额尚未实测。
 
@@ -112,7 +114,7 @@ npm run build
 
 测试区分 Provider SSE fixtures、核心/SQLite真实执行、PocketBase hook模拟环境与UI状态测试。fixtures 不能证明 GLM 账户可用，也不能证明原 PocketBase 服务已经部署。最终验证记录在 [implementation-status.md](docs/implementation-status.md)。
 
-当前待外部联调：原画布实际登录环境、真实节点生成/钱包入口提取、资产服务。原生 PocketBase 隔离回归已通过，使用测试认证，不能替代真实用户认证验收。原项目有大量前端依赖和 VibeX 平台配置，本次不把独立工程构建成功当成原项目全量验收。
+线上原节点生成按用户确认的可用前提处理。Agent 的节点/钱包桥接已实现，待部署环境接线验收；资产服务待接入。原生 PocketBase 隔离回归已通过，使用测试认证。原应用集成构建通过，但不能替代多用户认证、浏览器视觉和部署验收。
 
 ## 节点媒体生成
 
