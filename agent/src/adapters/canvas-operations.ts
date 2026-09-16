@@ -56,4 +56,3 @@ export function applyCanvasOperations(source:CanvasSnapshot, changes:CanvasOpera
   doc.revision++;
   return doc;
 }
-

@@ -28,4 +28,3 @@ test('sequence acceptance drops replay and reports a gap', () => {
   assert.equal(next.lastSequence, 5);
   assert.equal(next.event?.id, '5');
 });
-

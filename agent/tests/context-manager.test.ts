@@ -79,4 +79,3 @@ test('image input fails explicitly when the active model lacks vision', () => {
   state.messages[0].content = [{ type: 'image', url: 'https://asset/image.png' }];
   assert.throws(() => manager.prepare(state, '', { ...capabilities, vision: false }), /不支持图片输入/);
 });
-
