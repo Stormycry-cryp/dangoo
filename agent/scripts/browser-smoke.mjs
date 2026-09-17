@@ -3,7 +3,8 @@
 import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+import { moduleSpecifier } from './module-specifier.mjs';
+const { chromium } = await import(moduleSpecifier(process.env.PLAYWRIGHT_MODULE || 'playwright'));
 const baseUrl = process.env.DANGOO_MOCK_UI_URL || 'http://127.0.0.1:5173';
 const parsed = new URL(baseUrl);
 assert.ok(['localhost', '127.0.0.1'].includes(parsed.hostname), 'Mock browser test must target localhost');

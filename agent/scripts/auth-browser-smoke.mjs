@@ -1,6 +1,10 @@
 // Original Canvas + built widget, with only HTTP business responses simulated.
 import assert from 'node:assert/strict';
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { moduleSpecifier } from './module-specifier.mjs';
+const { chromium } = await import(moduleSpecifier(process.env.PLAYWRIGHT_MODULE || 'playwright'));
 const base = process.env.DANGOO_HOST_UI_URL || 'http://127.0.0.1:5174';
 assert.ok(['localhost', '127.0.0.1'].includes(new URL(base).hostname));
 const token = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.local-fixture`;
@@ -64,7 +68,10 @@ try {
   console.log('Host browser auth PASS: original login dialog, PB credential forwarding, logout unmount, 401 clears stale session and reopens original login. Business HTTP is mocked.');
 } catch (error) {
   console.error(await page.locator('body').innerText());
-  await page.screenshot({ path: '/tmp/dangoo-host-auth-failure.png', animations: 'disabled' });
+  const failureDir = await mkdtemp(join(tmpdir(), 'dangoo-host-auth-'));
+  const screenshot = join(failureDir, 'failure.png');
+  await page.screenshot({ path: screenshot, animations: 'disabled' });
+  console.error(`Failure screenshot: ${screenshot}`);
   throw error;
 } finally {
   await browser.close();

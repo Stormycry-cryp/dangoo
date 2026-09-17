@@ -207,7 +207,7 @@ function normalizedResourcePath(relativePath: string): string {
     throw new SkillRegistryError('Invalid skill resource path', 'path');
   }
   const portable = relativePath.replaceAll('\\', '/');
-  if (portable.startsWith('/') || /^[A-Za-z]:\//.test(portable)) {
+  if (portable.startsWith('/') || /^[A-Za-z]:/.test(portable)) {
     throw new SkillRegistryError('Skill resource path must be relative', 'path');
   }
   const parts = portable.split('/');

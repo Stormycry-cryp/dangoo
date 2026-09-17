@@ -1,9 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { SkillRegistry } from '../src/skills/index.js';
+
+function isWindowsSymlinkPrivilegeError(error: unknown): boolean {
+  if (process.platform !== 'win32' || !(error instanceof Error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'ENOTSUP';
+}
 
 async function makeSkill(root: string, name: string, body: string, revision = '1.0.0'): Promise<string> {
   const dir = path.join(root, name);
@@ -12,8 +18,11 @@ async function makeSkill(root: string, name: string, body: string, revision = '1
   return dir;
 }
 
-test('scope precedence and immutable snapshot content survive a refresh', async () => {
+test('scope precedence and immutable snapshot content survive a refresh', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dangoo-skills-'));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
   const builtin = path.join(root, 'builtin');
   const user = path.join(root, 'user');
   await makeSkill(builtin, 'draw', 'builtin body');
@@ -28,21 +37,61 @@ test('scope precedence and immutable snapshot content survive a refresh', async 
   assert.equal(await registry.read('draw', first), 'user body\n');
 });
 
-test('metadata, progressive resources, dependencies and symlink containment are enforced', async () => {
+test('metadata, progressive resources and portable resource paths are enforced', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dangoo-skills-'));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
   const skillDir = await makeSkill(root, 'collage', 'collage body');
   await mkdir(path.join(skillDir, 'docs'));
   await writeFile(path.join(skillDir, 'docs', 'guide.md'), 'guide');
+  const registry = new SkillRegistry({ roots: [{ path: root, scope: 'workspace' }] });
+  const result = await registry.discover();
+  assert.equal(await registry.resource('collage', 'docs/guide.md', result.snapshot), 'guide');
+  for (const escapedPath of ['../outside', '..\\outside', 'C:\\outside', '\\\\server\\share', 'C:outside']) {
+    await assert.rejects(() => registry.resource('collage', escapedPath, result.snapshot), /escapes|relative/);
+  }
+  assert.match(registry.catalog(result.snapshot), /collage/);
+});
+
+test('file symlink resources cannot escape their package', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'dangoo-skills-file-symlink-'));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const skillDir = await makeSkill(root, 'collage', 'collage body');
   const outside = path.join(root, 'outside.txt');
   await writeFile(outside, 'secret');
-  await symlink(outside, path.join(skillDir, 'escape.txt'));
+  try {
+    await symlink(outside, path.join(skillDir, 'escape.txt'), 'file');
+  } catch (error) {
+    if (isWindowsSymlinkPrivilegeError(error)) {
+      t.skip('file symlink creation requires Windows symlink privileges');
+      return;
+    }
+    throw error;
+  }
   const registry = new SkillRegistry({ roots: [{ path: root, scope: 'workspace' }] });
   const result = await registry.discover();
   assert.equal(result.errors.some((error) => error.message.includes('symlink')), true);
-  assert.equal(await registry.resource('collage', 'docs/guide.md', result.snapshot), 'guide');
-  await assert.rejects(() => registry.resource('collage', '../outside.txt', result.snapshot), /escapes|relative/);
-  await assert.rejects(() => registry.resource('collage', 'escape.txt', result.snapshot), /symlink|resource/);
-  assert.match(registry.catalog(result.snapshot), /collage/);
+  await assert.rejects(() => registry.resource('collage', 'escape.txt', result.snapshot), /symlink|resource|path/);
+});
+
+test('directory links cannot escape their package', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'dangoo-skills-directory-link-'));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const skillDir = await makeSkill(root, 'collage', 'collage body');
+  const outside = path.join(root, 'outside-dir');
+  await mkdir(outside);
+  await writeFile(path.join(outside, 'secret.txt'), 'secret');
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  await symlink(outside, path.join(skillDir, 'escape-dir'), linkType);
+  const registry = new SkillRegistry({ roots: [{ path: root, scope: 'workspace' }] });
+  const result = await registry.discover();
+  assert.equal(result.errors.some((error) => error.message.includes('symlink')), true);
+  await assert.rejects(() => registry.resource('collage', 'escape-dir/secret.txt', result.snapshot), /symlink|resource|path/);
 });
 
 test('implicit selection excludes explicitly disabled or non-implicit skills', () => {
