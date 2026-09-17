@@ -20,20 +20,6 @@ export function isDurableOutputMediaUrl(url: string | undefined | null): boolean
   return /^https?:\/\/rh-images\.xiaoyaoyou\.com\/[0-9a-f]+\/output\//i.test(url)
 }
 
-/** @deprecated 改用 isDurableOutputMediaUrl(图片/音频/视频成品共用同一永久前缀) */
-export function isDurableOutputImageUrl(url: string | undefined | null): boolean {
-  return isDurableOutputMediaUrl(url)
-}
-
-/**
- * 平台临时签名链接(输入上传链): 带 q-sign-* 签名, 约 24h 后 403, 必须在有效期内转存。
- * 形态: https://rh-images-switch-*.cos.*.myqcloud.com/input/openapi/<hash>.<ext>?q-sign-algorithm=...
- */
-export function isTemporarySignedMediaUrl(url: string | undefined | null): boolean {
-  if (!url) return false
-  return /^https?:\/\/[^/]*myqcloud\.com\//i.test(url) && /[?&]q-sign-/.test(url)
-}
-
 /**
  * 归一化媒体路径: 剥掉任何历史部署前缀, 得到与环境无关的裸路径("/api/files/...")。
  * 旧数据把生成时的部署形态(/app-preview/app-xxx/__pb 或 /p/app-xxx/__pb)固化进了 URL,
