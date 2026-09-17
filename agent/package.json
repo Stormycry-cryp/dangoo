@@ -1,0 +1,41 @@
+{
+  "name": "@dangoo/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --env-file-if-exists=.env src/server/main.ts",
+    "dev:mock": "tsx scripts/mock-agent.ts",
+    "dev:ui": "vite --host 127.0.0.1",
+    "build": "npm run typecheck && npm run build:server && npm run build:ui && npm run build:widget && npm run build:bridge",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "smoke:mock": "tsx scripts/mock-smoke.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:ui": "vite build",
+    "build:widget": "vite build --mode widget",
+    "build:bridge": "node scripts/build-host-bridge.mjs",
+    "start": "node --env-file-if-exists=.env dist/runtime/server/main.js",
+    "check:provider": "tsx --env-file-if-exists=.env scripts/check-provider.ts"
+  },
+  "dependencies": {
+    "ajv": "8.17.1",
+    "better-sqlite3": "11.10.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "yaml": "2.8.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.15.30",
+    "@types/react": "19.1.6",
+    "@types/react-dom": "19.1.6",
+    "typescript": "5.8.3",
+    "tsx": "4.20.3",
+    "vite": "6.3.5"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

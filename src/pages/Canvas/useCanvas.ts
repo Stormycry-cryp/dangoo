@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-import { useStore } from 'zustand'
 import {
   callAigcAndPoll,
   resumeAigcJob,
@@ -18,7 +17,7 @@ import {
 import type { AigcModelInfo, AigcHistoryItem, AigcResult, AiAppRunResponse } from '@/lib/aigc'
 import { callLlmWithFallback } from '@/lib/llm'
 import type { LlmContentPart, LlmMessage, LlmCallResult } from '@/lib/llm'
-import { persistMedia, toRhMediaUrl, toRhMediaUrls, isPersistedMediaUrl, mediaSrc } from '@/lib/media'
+import { persistMedia, toRhMediaUrl, toRhMediaUrls, isPersistedMediaUrl, isDurableOutputMediaUrl, mediaSrc, canonicalMediaPath, getMediaUploadInflight } from '@/lib/media'
 import {
   detectAssistant,
   importToAdobe,
@@ -35,11 +34,18 @@ import {
 } from '@/lib/localAuth'
 import { getAuthHeaders } from '@/lib/auth'
 import {
+  putLocalSnapshot,
+  clearLocalSnapshot,
   listStaleSnapshots,
   deleteStaleSnapshot,
   pruneExpiredSnapshots,
+  putConflictBackup,
+  takeConflictBackup,
   canvasContentFingerprint,
+  type LocalCanvasSnapshot,
 } from '@/lib/canvasLocalSnapshot'
+import { acquireCloudSlot, tryAcquireCloudSlot } from '@/lib/cloudSaveQueue'
+import { postCanvasMessage, onCanvasMessage } from '@/lib/canvasBroadcast'
 import { loadImageNatural, sha256Hex, computePaddedRect, extractPatchCanvas, mergePatchesCanvas } from '@/components/canvas/imageEdit/localPatch'
 import type { CropContext } from '@/components/canvas/imageEdit/localPatch'
 export type { CropContext } from '@/components/canvas/imageEdit/localPatch'
@@ -62,6 +68,7 @@ import {
   DEFAULT_MOTION_PROMPT,
   I2I_MODELS,
   I2V_MODELS,
+  LEGACY_VIDEO_SLUG_MAP,
   MULTIMODAL_VIDEO_MODEL,
   POLISH_LLM_OPTIONS,
   REP_PANEL_POLISH_MODEL,
@@ -116,6 +123,9 @@ import {
   defaultMergeState,
   defaultPolishState,
   defaultRepState,
+  defaultTtsState,
+  defaultMotionState,
+  defaultVsrState,
   foldPanelCount,
   foldPanelRoles,
   foldSpecText,
@@ -139,6 +149,7 @@ import type {
   GlobalAssetFolder,
   ImageEditGridPart,
   JobSpec,
+  LayerStage,
   LayerItem,
   LayerNodeState,
   LoopNodeState,
@@ -150,6 +161,7 @@ import type {
   ProjectAssets,
   ProjectAssetKind,
   ProjectAssetMember,
+  RepStage,
   RepNodeState,
   RepSlot,
   StageGesture,
@@ -200,10 +212,6 @@ import {
 } from './cameraModel'
 import { useGlobalTags } from '@/components/canvas/tags/useGlobalTags'
 import { LEGACY_PIN_MAP } from '@/components/canvas/tags/tagModel'
-import { useCanvasGeneration } from './useCanvasGeneration'
-import { useCanvasMedia } from './useCanvasMedia'
-import { useCanvasSave } from './useCanvasSave'
-import { createCanvasDocumentStore } from './canvasDocumentStore'
 
 /** 共享空数组: 派生索引未命中时返回它, 避免每次查询新建数组引发下游无谓重渲染 */
 const EMPTY_STRINGS: readonly string[] = []
@@ -218,6 +226,44 @@ const ASSET_FOLDERS_API = `${getPocketBaseUrl()}/api/asset_folders`
 // 画布内复制卡片后写入系统剪贴板的标记: 让随后的粘贴事件识别为「画布卡片粘贴」而非外部图片
 const CANVAS_CLIP_MARKER = 'dangoo-canvas-clipboard'
 const LOOP_BATCH_SIZE = 9
+// 失败主动重试退避(毫秒): 1s→3s→10s→30s→60s 封顶, 实际值再加 ±20% 抖动避免多标签齐发
+const RETRY_BACKOFF_MS = [1000, 3000, 10000, 30000, 60000]
+// keepalive fetch 浏览器上限 64KB, 留余量: 全量保存体超过该值在卸载路径不强发(本地盘已有快照)
+const KEEPALIVE_BODY_LIMIT = 60_000
+
+/** 同步短哈希(cyrb53): 为全量保存体生成幂等指纹, 同内容重试复用同一幂等键 */
+function cyrb53Hex(str: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  const h = (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16)
+  return h.padStart(14, '0')
+}
+
+/**
+ * 当前标签页会话标识: 用 sessionStorage 存, 复制标签页会被浏览器复制一份旧值,
+ * 启动时发现键已存在即换发新 id。本地快照按「画布 id + 会话 id」分键,
+ * 因此同一浏览器多个标签同时编辑同一画布也不会互踩兜底快照。
+ */
+function currentSessionId(): string {
+  try {
+    const KEY = 'rh-canvas-session'
+    const existing = sessionStorage.getItem(KEY)
+    if (existing) return existing
+    const id =
+      (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `s-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    sessionStorage.setItem(KEY, id)
+    return id
+  } catch {
+    return `s-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }
+}
 
 /**
  * 工作流重建后: 给摄影机卡按当前画布与本批内已用字母重新命名,
@@ -265,24 +311,10 @@ export function useCanvas() {
   const { id: canvasId } = useParams()
 
   // --- 画布文档 ---
-  const documentStoreRef = useRef<ReturnType<typeof createCanvasDocumentStore>>(undefined)
-  if (!documentStoreRef.current) documentStoreRef.current = createCanvasDocumentStore(canvasId ?? '')
-  const documentStore = documentStoreRef.current
-  const docLoaded = useStore(documentStore, state => state.docLoaded)
-  const canvasTitle = useStore(documentStore, state => state.canvasTitle)
-  const cards = useStore(documentStore, state => state.cards)
-  const connections = useStore(documentStore, state => state.connections)
-  const viewport = useStore(documentStore, state => state.viewport)
-  const projectAssets = useStore(documentStore, state => state.projectAssets)
-  const {
-    setActiveCanvasId,
-    setDocLoaded,
-    setCanvasTitle,
-    setCards,
-    setConnections,
-    setViewport: setViewportState,
-    setProjectAssets,
-  } = documentStore.getState()
+  const [docLoaded, setDocLoaded] = useState(false)
+  const [canvasTitle, setCanvasTitle] = useState('未命名画布')
+  const [cards, setCards] = useState<CanvasCardData[]>([])
+  const [viewport, setViewportState] = useState<CanvasViewport>({ x: 80, y: 80, scale: 1 })
   // viewportRef 始终持有最新视图; 拖动/滚轮平移时直接改 transform 的快速路径读它, 不走 React 渲染
   const viewportRef = useRef(viewport)
   // 最近一次已提交视图的位置: 快速平移按它算位移阈值, 任何视图变更(缩放/适应内容/提交)都经统一入口刷新
@@ -332,31 +364,80 @@ export function useCanvas() {
     el.style.width = `${rect.w}px`
     el.style.height = `${rect.h}px`
   }
-  const {
-    pendingJobs,
-    setPendingJobs,
-    genLogs,
-    setGenLogs,
-    logDialogOpen,
-    setLogDialogOpen,
-    sessionTokenRef,
-    beginJobSignal,
-    endJobSignal,
-    abortAllJobs,
-    aliveForSession,
-    acquireRunLock,
-    releaseRunLock,
-    isRunInflight,
-    batchRunInflight,
-  } = useCanvasGeneration(documentStore)
-  const {
-    cacheDataUrl,
-    readDataUrl,
-    normalizeRestoredCards,
-    rehostTempMediaCards,
-    healResultImageByTask,
-    buildPersistCards,
-  } = useCanvasMedia(documentStore)
+  // 保存状态六档: idle 未改动 / editing 防抖窗口内 / local 本地已落盘待同步 / saving 云端同步中
+  // / saved 已保存 / error 同步失败重试中 / conflict 多端版本冲突待选择
+  const [saveState, setSaveState] = useState<'idle' | 'editing' | 'local' | 'saving' | 'saved' | 'error' | 'conflict'>('idle')
+  // 多标签/多设备保存冲突: 服务端 409 后不再自动用旧快照覆盖, 暂存待处理冲突让用户二选一
+  const saveConflictRef = useRef<{ canvasId: string; serverRev: number } | null>(null)
+  type SaveConflictValue = { canvasId: string; serverRev: number } | null
+  const [saveConflict, setSaveConflictState] = useState<SaveConflictValue>(null)
+  const setSaveConflict = (v: SaveConflictValue | ((prev: SaveConflictValue) => SaveConflictValue)) => {
+    setSaveConflictState(prev => {
+      const next = typeof v === 'function' ? (v as (p: SaveConflictValue) => SaveConflictValue)(prev) : v
+      saveConflictRef.current = next
+      return next
+    })
+  }
+  // 本标签页会话标识(本地快照分键用), 挂载即定不再变
+  const browserSessionIdRef = useRef<string>('')
+  if (!browserSessionIdRef.current) browserSessionIdRef.current = currentSessionId()
+  // 崩溃恢复弹窗: 上次异常关闭留下的本地快照。ref 镜像供保存链路在闭包里即时读取
+  const [localRestore, setLocalRestoreState] = useState<{
+    canvasId: string
+    snapshot: LocalCanvasSnapshot
+    originSessionId: string
+    differsFromCloud: boolean
+  } | null>(null)
+  const localRestoreRef = useRef<typeof localRestore>(null)
+  const setLocalRestore = (v: typeof localRestore | ((prev: typeof localRestore) => typeof localRestore)) => {
+    setLocalRestoreState(prev => {
+      const next = typeof v === 'function' ? (v as (p: typeof localRestore) => typeof localRestore)(prev) : v
+      localRestoreRef.current = next
+      return next
+    })
+  }
+  // 崩溃恢复弹窗挂起时, 云端文档携带的待续轮询任务(选「以云端为准」时恢复轮询)
+  const cloudPendingAtRestoreRef = useRef<PendingJobRecord[]>([])
+  // 冲突选「加载最新」前自动备份本地改动, 提供一次「取回我的版本」
+  const [conflictBackupAvailable, setConflictBackupAvailable] = useState(false)
+  // 主动重试: 每个画布的退避档位与定时器
+  const retryTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  const retryStepRef = useRef<Record<string, number>>({})
+  const [pendingJobs, setPendingJobs] = useState<PendingJobRecord[]>([])
+  // 生成日志: 随画布数据持久化(canvas_data.logs), 新日志 unshift 到头部, 最多保留最近 500 条
+  const [genLogs, setGenLogs] = useState<GenLogEntry[]>([])
+  const genLogsRef = useRef<GenLogEntry[]>([])
+  genLogsRef.current = genLogs
+  const [logDialogOpen, setLogDialogOpen] = useState(false)
+  const cardsRef = useRef<CanvasCardData[]>([])
+  cardsRef.current = cards
+  // 会话闸门: 每次进入/切换画布自增。所有延迟异步回写(轮询/转存/复刻建卡/抠图)先比对令牌,
+  // 防止在 A 画布发起的任务完成后把结果写进 B 画布。
+  const sessionTokenRef = useRef(0)
+  // 本会话所有生成轮询的取消器: 切画布时统一 abort, 不再让旧画布的轮询空跑到超时。
+  const jobAbortsRef = useRef<Set<AbortController>>(new Set())
+  /** 登记一次可取消的生成轮询, 返回该任务专属 signal */
+  function beginJobSignal(): AbortSignal {
+    const ac = new AbortController()
+    jobAbortsRef.current.add(ac)
+    return ac.signal
+  }
+  /** 轮询终态后注销取消器 */
+  function endJobSignal(signal: AbortSignal | undefined) {
+    if (!signal) return
+    const found = [...jobAbortsRef.current].find(ac => ac.signal === signal)
+    if (found) jobAbortsRef.current.delete(found)
+  }
+  /** 仍属于当前画布会话才执行回写 */
+  function aliveForSession(token: number): boolean {
+    return token === sessionTokenRef.current
+  }
+  // 项目资产快照桶需先于 docBucketsRef 声明: 下方每次渲染都会把最新项目资产写进画布快照
+  const projectAssetsRef = useRef<ProjectAssets>({ items: [], folders: [] })
+  // 会话期快照桶(按画布 id 索引): 渲染时持续刷新为最新值, 切画布瞬间仍能拿到旧画布的最终快照做 flush
+  const docBucketsRef = useRef<
+    Record<string, { cards: CanvasCardData[]; connections: CanvasConnection[]; viewport: CanvasViewport; title: string; pending: PendingJobRecord[]; projectAssets: ProjectAssets; logs: GenLogEntry[]; rev: number }>
+  >({})
 
   // --- 选择与手势 ---
   const stageRef = useRef<HTMLDivElement | null>(null)
@@ -375,11 +456,44 @@ export function useCanvas() {
   // 由选中副作用读取后立即清掉, 不影响后续点击/新建/复制等路径的自动展开
   const suppressAutoPanelRef = useRef(false)
   const [connectionDraft, setConnectionDraft] = useState<ConnectionDraft | null>(null)
+  const [connections, setConnections] = useState<CanvasConnection[]>([])
+  const connectionsRef = useRef<CanvasConnection[]>([])
   // 画布内复制粘贴: ⌘/Ctrl+C 存选中卡+组内连线, ⌘/Ctrl+V 粘贴(每次递增偏移避免叠在原副本上)
   const clipboardRef = useRef<
     { cards: CanvasCardData[]; conns: Array<{ fromId: string; toId: string; toSlot?: RepSlot }> } | null
   >(null)
   const pasteSeqRef = useRef(0)
+  connectionsRef.current = connections
+  // 每张卡「上一版已确认」的媒体字段(url + 结果项)。上传/替换图片时卡片先显示 blob: 本地预览,
+  // 若此时自动保存/切后台/关页触发全量保存, 不能用空 URL 覆盖云端(否则刷新后图没了、卡片塌成小卡),
+  // 用这里的上一版媒体字段顶替入库。只存轻量字段, 避免大画布每渲染深拷贝整卡的性能成本。
+  const lastPersistedMediaRef = useRef<Map<string, { url: string; results?: CanvasCardData['results'] }>>(new Map())
+  // 快照桶随每次渲染刷新为最新值(此时 cards/connections/viewport/pendingJobs 均已声明)
+  docBucketsRef.current[canvasId ?? ''] = {
+    cards, connections, viewport, title: canvasTitle, pending: pendingJobs,
+    projectAssets: projectAssetsRef.current,
+    logs: genLogs,
+    rev: docBucketsRef.current[canvasId ?? '']?.rev ?? 0,
+  }
+  // 渲染期同步「已确认媒体字段」: 有非 blob 永久链接的卡即为可兜底版本(图片 await 上传成功才换此 URL)。
+  // buildPersistCards 在下次上传在途时用它顶替, 防止自动保存剥空图片覆盖云端; 顺带清理已删除卡。
+  {
+    const liveIds = new Set(cards.map(c => c.id))
+    Array.from(lastPersistedMediaRef.current.keys()).forEach(id => {
+      if (!liveIds.has(id)) lastPersistedMediaRef.current.delete(id)
+    })
+    cards.forEach(c => {
+      if (c.url && !c.url.startsWith('blob:')) {
+        const prev = lastPersistedMediaRef.current.get(c.id)
+        if (!prev || prev.url !== c.url) {
+          lastPersistedMediaRef.current.set(c.id, {
+            url: c.url,
+            ...(c.results ? { results: c.results.map(r => ({ ...r })) } : {}),
+          })
+        }
+      }
+    })
+  }
   /** 手动拉缩放手柄期间暂停尺寸回写, 避免与回写互相打架 */
   const resizingRef = useRef(false)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -399,7 +513,7 @@ export function useCanvas() {
   const [editDialogMode, setEditDialogMode] = useState<'crop' | 'draw' | 'grid' | 'extract' | null>(null)
 
   function openImageEditor(cardId: string, mode: 'crop' | 'draw' | 'grid' | 'extract') {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card?.url || card.kind === 'video') return
     setEditDialogId(cardId)
     setEditDialogMode(mode)
@@ -463,7 +577,7 @@ export function useCanvas() {
    * 追加到源卡右侧网格排布, 并从源卡连线。
    */
   async function applyGridSplit(cardId: string, parts: ImageEditGridPart[]) {
-    const source = documentStore.getState().cards.find(c => c.id === cardId)
+    const source = cardsRef.current.find(c => c.id === cardId)
     if (!source) return
     const gridGroupId = uid()
     const uploaded: Array<{ part: ImageEditGridPart; url: string }> = []
@@ -517,7 +631,7 @@ export function useCanvas() {
     frames: Array<{ id: string; blob: Blob; timeSec: number; naturalW: number; naturalH: number }>,
   ): Promise<string[]> {
     if (!frames.length) return []
-    const source = documentStore.getState().cards.find(c => c.id === sourceCardId)
+    const source = cardsRef.current.find(c => c.id === sourceCardId)
     if (!source) {
       toast.error('源视频卡已被删除, 无法添加帧')
       return []
@@ -543,7 +657,7 @@ export function useCanvas() {
       return []
     }
     // 上传是串行 await, 落卡前复查源卡仍存在(上传期间可能被删), 避免孤立卡与悬空连线
-    const liveSource = documentStore.getState().cards.find(c => c.id === sourceCardId)
+    const liveSource = cardsRef.current.find(c => c.id === sourceCardId)
     if (!liveSource) {
       toast.error('源视频卡已被删除, 已取消添加')
       return []
@@ -598,7 +712,7 @@ export function useCanvas() {
     cardId: string,
     sel: { x: number; y: number; w: number; h: number; sourceWidth: number; sourceHeight: number },
   ) {
-    const source = documentStore.getState().cards.find(c => c.id === cardId)
+    const source = cardsRef.current.find(c => c.id === cardId)
     if (!source?.url || source.kind === 'video') {
       toast.error('请先选择一张图片')
       return
@@ -669,9 +783,9 @@ export function useCanvas() {
     patches: Array<{ card: CanvasCardData; url: string; context: CropContext }>
     error?: string
   } {
-    const fromCards = documentStore.getState().connections
+    const fromCards = connectionsRef.current
       .filter(conn => conn.toId === cardId)
-      .map(conn => documentStore.getState().cards.find(c => c.id === conn.fromId))
+      .map(conn => cardsRef.current.find(c => c.id === conn.fromId))
       .filter((c): c is CanvasCardData => !!c?.url && c.kind !== 'video' && !cardShowsVideo(c))
     const originals: Array<{ card: CanvasCardData; url: string }> = []
     const patches: Array<{ card: CanvasCardData; url: string; context: CropContext }> = []
@@ -691,7 +805,7 @@ export function useCanvas() {
 
   /** 融合: 校验原图指纹/尺寸后把局部图羽化叠回原图, 结果卡 cropContext=null(完整图边界) */
   async function handleRunMerge(cardId: string) {
-    const mergeCard = documentStore.getState().cards.find(c => c.id === cardId)
+    const mergeCard = cardsRef.current.find(c => c.id === cardId)
     if (!mergeCard) return
     const colorMatch = mergeCard.mergeState?.colorMatch ?? true
     const inputs = mergeInputs(cardId)
@@ -774,7 +888,7 @@ export function useCanvas() {
   }
 
   function setMergeColorMatch(cardId: string, v: boolean) {
-    const cur = documentStore.getState().cards.find(c => c.id === cardId)?.mergeState ?? defaultMergeState()
+    const cur = cardsRef.current.find(c => c.id === cardId)?.mergeState ?? defaultMergeState()
     updateCard(cardId, { mergeState: { ...cur, colorMatch: v } })
   }
 
@@ -797,6 +911,27 @@ export function useCanvas() {
   const [runningCount, setRunningCount] = useState(0)
   const [needsRhLogin, setNeedsRhLogin] = useState(false)
 
+  // 同步重入锁: 处理器在第一个 await 之前同步占锁, 防止双击/连点造成重复提交与重复扣费。
+  // 任务终态(成功/失败/取消)前 key 一直在集合内, finally 释放; 失败后立即可再次点击。
+  const inflightRunRef = useRef<Set<string>>(new Set())
+  /** 同步尝试占锁: 已在执行返回 false; 占成功返回 true。必须在任何 await 之前调用 */
+  function acquireRunLock(key: string): boolean {
+    if (inflightRunRef.current.has(key)) return false
+    inflightRunRef.current.add(key)
+    return true
+  }
+  function releaseRunLock(key: string) {
+    inflightRunRef.current.delete(key)
+  }
+  /** 单节点/单项/卡片/Agent/润色/Loop 等单 key 入口的在途判断 */
+  function isRunInflight(key: string): boolean {
+    return inflightRunRef.current.has(key)
+  }
+  /** 批量运行在途: 任意一个批量提交未结束 */
+  function batchRunInflight(): boolean {
+    for (const k of inflightRunRef.current) if (k.startsWith('batch:')) return true
+    return false
+  }
 
   // --- 账号 / 计费 / 钱包 ---
   const [account, setAccount] = useState<LocalAccount | null>(() => getLocalAccount())
@@ -873,7 +1008,25 @@ export function useCanvas() {
     setAccount(getLocalAccount())
     setAuthDialog(null)
     void refreshWallet()
-    resumeAfterAuth()
+    // 登录过期时 sendPersist 把改动留在了 dirty 里, 登录后立即补发, 不让用户白编辑
+    try {
+      const id = lastCanvasIdRef.current || canvasId
+      if (id) {
+        const marks = saveDirtyRef.current[id]
+        if (marks?.full || marks?.view) {
+          if (saveTimerRef.current[id]) {
+            clearTimeout(saveTimerRef.current[id])
+            delete saveTimerRef.current[id]
+          }
+          clearRetryTimer(id)
+          retryStepRef.current[id] = 0
+          setSaveState('saving')
+          void sendPersist(id)
+        }
+      }
+    } catch {
+      /* 续存失败等下一次编辑/重试 */
+    }
   }
 
   /** 统一识别生成结果里的登录/余额问题并弹窗; 返回是否命中 */
@@ -943,6 +1096,9 @@ export function useCanvas() {
   const [globalFolders, setGlobalFolders] = useState<GlobalAssetFolder[]>([])
   const [foldersLoading, setFoldersLoading] = useState(false)
   // 项目库(随画布保存): 面板开合不持久化, 资产与文件夹持久化
+  const [projectAssets, setProjectAssets] = useState<ProjectAssets>({ items: [], folders: [] })
+  projectAssetsRef.current = projectAssets
+
   // --- 润色进行中标记(复刻节点用, 含 cardId 前缀) ---
   const [polishingField, setPolishingField] = useState<string | null>(null)
   // --- 生成节点内联润色中(看图反推 / 提示词优化, 结果回填到本节点输入框) ---
@@ -953,10 +1109,64 @@ export function useCanvas() {
   const [jianyingImporting, setJianyingImporting] = useState(false)
   const [adobeImporting, setAdobeImporting] = useState<AdobeApplication | null>(null)
 
+  // --- 运行时 dataUrl 缓存(不持久化, 刷新后按需重取) ---
+  // LRU 有界: value 是全尺寸图片的 base64(单张可达数 MB), 只服务一次性视觉分析,
+  // 若用无界 Record 缓存, 连续分析/反复换图会让长会话内存只增不减(数百 MB)。
+  // Map 的键按插入顺序保留, 命中时 delete+set 提到最新, 超容量从最旧开始淘汰。
+  const DATA_URL_CACHE_MAX = 24
+  const dataUrlCacheRef = useRef<Map<string, string>>(new Map())
+  function cacheDataUrl(key: string, value: string) {
+    const m = dataUrlCacheRef.current
+    if (m.has(key)) m.delete(key)
+    m.set(key, value)
+    while (m.size > DATA_URL_CACHE_MAX) {
+      const oldest = m.keys().next().value
+      if (oldest === undefined) break
+      m.delete(oldest)
+    }
+  }
+  function readDataUrl(key: string): string | undefined {
+    const m = dataUrlCacheRef.current
+    const hit = m.get(key)
+    if (hit !== undefined) {
+      m.delete(key)
+      m.set(key, hit)
+    }
+    return hit
+  }
+
   // ---------- 工具函数(闭包内) ----------
 
   function updateCard(cardId: string, patch: Partial<CanvasCardData>) {
     setCards(prev => prev.map(c => (c.id === cardId ? { ...c, ...patch } : c)))
+  }
+
+  /**
+   * 关键状态(媒体永久链接、远端任务 ID 等)到手后的「立刻落盘」: 等一拍让 setState 灌进快照桶,
+   * 再把全量保存防抖从最长 ~1.5s 提前到 ~250ms, 压缩「刚提交/刚传完就关页或返回首页」的丢失窗口。
+   * requireCardId 给定时只在该卡仍存在时落(媒体场景); 任务受理等场景不传, 只校验画布已加载。
+   * 关页本身还有 beforeunload+pagehide keepalive+本地快照兜底, 这里是额外一道保险。
+   */
+  function requestQuickFullSave(requireCardId?: string) {
+    const target = lastCanvasIdRef.current || canvasId
+    if (!target || !docLoaded) return
+    setTimeout(() => {
+      const b = docBucketsRef.current[target]
+      if (!b) return
+      if (requireCardId && !b.cards.some(c => c.id === requireCardId)) return
+      const marks = saveDirtyRef.current[target] || { full: false, view: false }
+      marks.full = true
+      saveDirtyRef.current[target] = marks
+      if (saveTimerRef.current[target]) clearTimeout(saveTimerRef.current[target])
+      saveTimerRef.current[target] = setTimeout(() => {
+        delete saveTimerRef.current[target]
+        void sendPersist(target)
+      }, 250)
+    }, 0)
+  }
+
+  function flushAfterMediaSaved(cardId: string) {
+    requestQuickFullSave(cardId)
   }
 
   function patchLayerState(cardId: string, patch: Partial<LayerNodeState>) {
@@ -1284,19 +1494,19 @@ export function useCanvas() {
   })
   function upstreamImageUrls(cardId: string): readonly string[] {
     const index = inboundIndexRef.current
-    if (index.cards !== documentStore.getState().cards || index.connections !== documentStore.getState().connections) {
+    if (index.cards !== cardsRef.current || index.connections !== connectionsRef.current) {
       const map = new Map<string, string[]>()
       const imageById = new Map<string, string | undefined>()
-      documentStore.getState().cards.forEach(c => imageById.set(c.id, !cardShowsVideo(c) ? c.url : undefined))
-      documentStore.getState().connections.forEach(conn => {
+      cardsRef.current.forEach(c => imageById.set(c.id, !cardShowsVideo(c) ? c.url : undefined))
+      connectionsRef.current.forEach(conn => {
         const url = imageById.get(conn.fromId)
         if (!url) return
         const arr = map.get(conn.toId)
         if (!arr) map.set(conn.toId, [url])
         else if (!arr.includes(url)) arr.push(url)
       })
-      index.cards = documentStore.getState().cards
-      index.connections = documentStore.getState().connections
+      index.cards = cardsRef.current
+      index.connections = connectionsRef.current
       index.map = map
     }
     return index.map.get(cardId) ?? EMPTY_STRINGS
@@ -1304,7 +1514,7 @@ export function useCanvas() {
 
   /** 分层节点有效原图: 上传优先, 未上传时承接第一张上游连线图 */
   function effectiveLayerSource(cardId: string): string | null {
-    const ls = documentStore.getState().cards.find(c => c.id === cardId)?.layerState
+    const ls = cardsRef.current.find(c => c.id === cardId)?.layerState
     return ls?.sourceUrl ?? upstreamImageUrls(cardId)[0] ?? null
   }
 
@@ -1314,7 +1524,7 @@ export function useCanvas() {
   /** 解析四个图片槽各自的有效来源: 槽位上传 > 连到该槽的线 > 无槽通用线按序兜底。
    *  背面无来源时借用正面来源(只传/只连一张也能跑), 借用关系供换位使用。 */
   function resolveRepSlotSources(cardId: string): Record<RepSlot, RepSlotSource> {
-    const rs = documentStore.getState().cards.find(c => c.id === cardId)?.repState
+    const rs = cardsRef.current.find(c => c.id === cardId)?.repState
     const uploaded: Record<RepSlot, string | null> = {
       front: rs?.frontUrl ?? null,
       back: rs?.backUrl ?? null,
@@ -1323,9 +1533,9 @@ export function useCanvas() {
     }
     const bySlot: Record<RepSlot, RepSlotSource[]> = { front: [], back: [], logo: [], qr: [] }
     const generic: RepSlotSource[] = []
-    documentStore.getState().connections.forEach(conn => {
+    connectionsRef.current.forEach(conn => {
       if (conn.toId !== cardId) return
-      const up = documentStore.getState().cards.find(c => c.id === conn.fromId)
+      const up = cardsRef.current.find(c => c.id === conn.fromId)
       if (!up?.url || cardShowsVideo(up)) return
       const src: RepSlotSource = { kind: 'conn', connId: conn.id, url: up.url }
       if (src && conn.toSlot) {
@@ -1390,6 +1600,153 @@ export function useCanvas() {
 
   // ---------- 画布文档加载 / 保存 ----------
 
+  /** 老数据兼容 + 新节点中间状态恢复: 运行中被刷新打断的任务标记失败可重试 */
+  /** 深度剥除卡片任意字段里固化的部署前缀(/app-preview|/p /app-xxx/__pb), 供跨环境自愈 */
+  function stripDeployedPrefix(value: unknown): any {
+    if (typeof value === 'string') {
+      return value.includes('/__pb/api/files/') ? canonicalMediaPath(value) : value
+    }
+    if (Array.isArray(value)) return value.map(v => stripDeployedPrefix(v))
+    if (value && typeof value === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const k of Object.keys(value as Record<string, unknown>)) {
+        out[k] = stripDeployedPrefix((value as Record<string, unknown>)[k])
+      }
+      return out
+    }
+    return value
+  }
+
+  function normalizeRestoredCards(
+    rawCards: CanvasCardData[],
+    inFlightResultKeys?: Set<string>,
+  ): CanvasCardData[] {
+    return rawCards.map(raw => {
+      // 历史数据可能把部署前缀(/app-preview/.../__pb 或 /p/.../__pb)固化进了媒体 URL,
+      // 切到另一种部署后前缀对不上会整批 404 裂图; 统一剥成环境无关的裸路径, 渲染时再按当前环境拼。
+      // 深度遍历卡片所有字段(url/results/refUrls/ttsState 等), 命中即归一化。
+      let c: CanvasCardData = stripDeployedPrefix(raw)
+      // 顶层运行态在刷新/跨环境恢复时必须收敛: 上传/生成任务不跨页面续跑,
+      // 残留 running/queued 会让卡片永久被当忙碌态——工具坞(导出/编辑/标签)与缩放柄全部不显示。
+      // 已有成品结果按成功收敛, 否则清回空闲(结果项自身的中断态在下面 generate 分支单独标失败可重试)。
+      if (c.jobStatus === 'running' || c.jobStatus === 'queued') {
+        const hasSuccess =
+          !!c.url ||
+          (Array.isArray(c.results) && c.results.some(r => r.itemStatus === 'success' && r.url))
+        c = { ...c, jobStatus: hasSuccess ? ('success' as const) : undefined }
+      }
+      if (c.kind === 'layer' && c.layerState) {
+        const ls = c.layerState
+        const layers = (ls.layers ?? []).map(l => {
+          if (l.genStatus === 'queued' || l.genStatus === 'running') {
+            return { ...l, genStatus: 'failed' as const, errorMsg: '任务在刷新时中断了, 请点击重试' }
+          }
+          return { ...l, cutoutUrl: null }
+        })
+        const stage: LayerStage = ls.stage === 'analyzing' || ls.stage === 'generating' ? (layers.length ? 'ready' : 'idle') : ls.stage
+        // 老数据生图渠道可能存的是图生 slug, 归一到家族主键(提交时再解析为图生 slug)
+        const layerFamily = channelFamilyOf(ls.genModel ?? '')
+        const layerGenModel = layerFamily ? layerFamily.key : 'gpt-image-2'
+        return { ...c, layerState: { ...defaultLayerState(), ...ls, layers, stage, genModel: layerGenModel } }
+      }
+      if (c.kind === 'replicate' && c.repState) {
+        const rs = c.repState
+        const jobStatus = {
+          front: rs.jobStatus?.front === 'running' || rs.jobStatus?.front === 'queued' ? ('failed' as const) : rs.jobStatus?.front ?? ('idle' as const),
+          back: rs.jobStatus?.back === 'running' || rs.jobStatus?.back === 'queued' ? ('failed' as const) : rs.jobStatus?.back ?? ('idle' as const),
+        }
+        const stage: RepStage = rs.stage === 'analyzing' || rs.stage === 'generating' ? (rs.frontPrompt || rs.backPrompt ? 'ready' : 'idle') : rs.stage
+        // 老数据生图渠道可能存的是图生 slug, 归一到家族主键(提交时再解析为图生 slug)
+        const genFamily = channelFamilyOf(rs.genModel ?? '')
+        const genModel = genFamily ? genFamily.key : 'gpt-image-2'
+        return { ...c, repState: { ...defaultRepState(), ...rs, jobStatus, stage, genModel } }
+      }
+      if ((c.kind as string) === 'image') {
+        // 老图片节点升级成统一生成节点: 原图进入节点图片位, 提示词保留(旧存文件名则清空), i2i 默认参数保留
+        const rawPrompt = c.prompt ?? ''
+        return {
+          ...c,
+          kind: 'generate' as CardKind,
+          prompt: looksLikeFileName(rawPrompt) ? '' : rawPrompt,
+          genParams: c.genParams ?? defaultImageGenParams(),
+          w: 320,
+          h: c.url ? Math.max(c.h, 560) : 180,
+        }
+      }
+      if (c.kind === 'generate') {
+        // 节点自身结果: 刷新时未完成的项标记失败可单项重试; active 项下标钳制并同步主图
+        let results = c.results
+        if (Array.isArray(results) && results.length) {
+          results = results.map((r, ri) => {
+            const inFlight = !!inFlightResultKeys?.has(`${c.id}:${ri}`)
+            // 有在途任务记录的排队/运行项: 保持 queued, 交给 restorePendingJobs 认领远端任务
+            // 续轮询(成功写结果/失败标错/真正丢失才中断), 不能先标失败, 否则用户点重试=重复提交扣费。
+            if (r.itemStatus === 'running') {
+              return inFlight ? { ...r, itemStatus: 'queued' as CardJobStatus, errorMsg: undefined } : r
+            }
+            if (r.itemStatus === 'queued' && !inFlight) {
+              return { ...r, itemStatus: 'failed' as CardJobStatus, errorMsg: '任务在刷新时中断了, 请点击重试' }
+            }
+            if (r.itemStatus === 'queued' && inFlight) {
+              return { ...r, errorMsg: undefined }
+            }
+            return r
+          })
+        }
+        const activeIdx = results && results.length ? Math.min(c.activeResultIndex ?? 0, results.length - 1) : 0
+        const active = results?.[activeIdx]
+        const firstOk = results?.find(r => r.itemStatus === 'success' && r.url)
+        const main = active && active.itemStatus === 'success' && active.url ? active : firstOk
+        return {
+          ...c,
+          results,
+          activeResultIndex: results && results.length ? activeIdx : c.activeResultIndex,
+          url: main?.url ?? c.url,
+          cropContext: main ? main.cropContext ?? null : c.cropContext,
+          genParams: {
+            ...defaultGenParams(),
+            ...c.genParams,
+            // 旧 Seedance 2.0「旗舰/标准版」节点统一迁移到全能参考接口
+            ...(c.genParams?.model && LEGACY_VIDEO_SLUG_MAP[c.genParams.model]
+              ? { model: LEGACY_VIDEO_SLUG_MAP[c.genParams.model] }
+              : {}),
+            // 早期数据空节点缺省比例时补 16:9; 已显式选了「自适应」的节点必须保留——
+            // 图生图场景下自适应要跟随参考图比例, 这里强写 16:9 会让选择静默失效
+            ...(c.url || main?.url || c.genParams?.aspectRatio ? {} : { aspectRatio: '16:9' }),
+          },
+          w: 320,
+          h: c.url || main?.url ? Math.max(c.h, 560) : 180,
+        }
+      }
+      if (c.kind === 'polish') {
+        return { ...c, polishState: { ...defaultPolishState(), ...c.polishState }, w: Math.max(c.w, 300), h: Math.max(c.h, 270) }
+      }
+      if (c.kind === 'tts') {
+        // 老版本地 blob 链接刷新即失效, 一律清空; 尺寸给足最小值
+        const ts: TtsNodeState = { ...defaultTtsState(), ...c.ttsState }
+        if (ts.cloneAudioUrl?.startsWith('blob:')) ts.cloneAudioUrl = undefined
+        if (ts.emotionRefAudioUrl?.startsWith('blob:')) ts.emotionRefAudioUrl = undefined
+        if (ts.resultUrl?.startsWith('blob:')) ts.resultUrl = undefined
+        return { ...c, ttsState: ts, w: Math.max(c.w, 380), h: Math.max(c.h, 560) }
+      }
+      if (c.kind === 'motion') {
+        const ms: MotionNodeState = { ...defaultMotionState(), ...c.motionState }
+        if (ms.refImageUrl?.startsWith('blob:')) { ms.refImageUrl = undefined; ms.refImageName = undefined }
+        if (ms.refVideoUrl?.startsWith('blob:')) { ms.refVideoUrl = undefined; ms.refVideoName = undefined; ms.refVideoDuration = undefined }
+        if (ms.resultUrl?.startsWith('blob:')) ms.resultUrl = undefined
+        // 高度自适应内容, 不强制最小高度
+        return { ...c, motionState: ms, w: Math.max(c.w, 380), h: c.h }
+      }
+      if (c.kind === 'vsr') {
+        const vs: VsrNodeState = { ...defaultVsrState(), ...c.vsrState }
+        if (vs.videoUrl?.startsWith('blob:')) { vs.videoUrl = undefined; vs.videoName = undefined; vs.videoDuration = undefined }
+        if (vs.resultUrl?.startsWith('blob:')) vs.resultUrl = undefined
+        return { ...c, vsrState: vs, w: Math.max(c.w, 380), h: c.h }
+      }
+      return c
+    })
+  }
+
   const lastCanvasIdRef = useRef<string | null>(null)
 
   // 「程序灌入服务端文档」时抑制随之而来的保存 effect(内容/视角各一个),
@@ -1406,40 +1763,6 @@ export function useCanvas() {
     }, 300)
   }
 
-  const {
-    saveState,
-    setSaveState,
-    saveConflict,
-    resolveConflictReload,
-    resolveConflictOverwrite,
-    restoreConflictBackup,
-    dismissConflictBackup,
-    localRestore,
-    setLocalRestore,
-    acceptLocalRestore,
-    discardLocalRestore,
-    deferLocalRestore,
-    conflictBackupAvailable,
-    flushPersistNow,
-    requestQuickFullSave,
-    flushAfterMediaSaved,
-    resumeAfterAuth,
-    browserSessionIdRef,
-    cloudPendingAtRestoreRef,
-  } = useCanvasSave({
-    canvasId,
-    documentStore,
-    lastCanvasIdRef,
-    sessionTokenRef,
-    suppressContentSaveRef,
-    suppressViewSaveRef,
-    buildPersistCards,
-    applyServerDoc,
-    resumeRestoredJobs,
-    setDocLoaded,
-    setAuthDialog,
-  })
-
   /** 把一份服务端画布文档灌入本地 state(初始加载/冲突后加载最新/多标签同步共用), 返回解析后的卡片与待续轮询任务 */
   function applyServerDoc(
     rec: { title?: string; canvas_data?: unknown },
@@ -1451,7 +1774,8 @@ export function useCanvas() {
     if (rec && typeof rec.title === 'string' && rec.title) setCanvasTitle(rec.title)
     const data = (rec?.canvas_data ?? {}) as Partial<CanvasDoc>
     // 加载最新即放弃本地旧基线, 直接采用服务端 rev(不做「只增不减」, 否则拿旧 rev 保存必再次 409)
-    documentStore.setBucketRevision(id, Number((data as { rev?: number }).rev ?? 0) || 0)
+    const bucket = docBucketsRef.current[id]
+    if (bucket) bucket.rev = Number((data as { rev?: number }).rev ?? 0) || 0
     const pendingRaw = Array.isArray(data.pendingJobs) ? data.pendingJobs : []
     // 仍在途的生成节点结果项(有 pending 记录): 归一化时保留排队态, 交给 restorePendingJobs
     // 按真实任务 ID/提示词认领远端在跑任务续轮询, 不能先标失败——否则用户只能点重试, 重复提交扣费。
@@ -1484,6 +1808,95 @@ export function useCanvas() {
     return { docCards, pending }
   }
 
+  /**
+   * 对一组卡里「会过期」的平台临时链接后台转存为本应用永久链接并替换; 失败静默跳过。
+   * 只转输入上传签名链(myqcloud/input/openapi?q-sign-*, ~24h 后 403);
+   * AI 成品输出图(rh-images.xiaoyaoyou.com/.../output/)是无签名长期公开对象, 不在此列——
+   * 旧版本把它们也转存到会丢的本地存储, 正是「再进画布图没了」黑卡的根因。
+   */
+  const rehostingRef = useRef<Set<string>>(new Set())
+  async function rehostTempMediaCards(cardList: CanvasCardData[]) {
+    const TEMP_HOST = /^https?:\/\/[^/]*myqcloud\.com\/.*[?&]q-sign-=/i
+    const jobs: Array<() => Promise<void>> = []
+    cardList.forEach(c => {
+      const pushJob = (oldUrl: string, kind: 'image' | 'video' | 'audio', apply: (permanent: string) => void) => {
+        if (!TEMP_HOST.test(oldUrl) || rehostingRef.current.has(oldUrl)) return
+        rehostingRef.current.add(oldUrl)
+        jobs.push(async () => {
+          try {
+            const permanent = await persistRemoteImage(oldUrl, kind)
+            if (permanent && permanent !== oldUrl && isPersistedMediaUrl(permanent)) {
+              apply(canonicalMediaPath(permanent))
+            }
+          } catch {
+            /* 单条失败不阻塞其它, 下次打开再试 */
+          } finally {
+            setTimeout(() => rehostingRef.current.delete(oldUrl), 60_000)
+          }
+        })
+      }
+      if (c.url) pushJob(c.url, c.kind === 'video' ? 'video' : 'image', u => updateCard(c.id, { url: u }))
+      c.results?.forEach((r, i) => {
+        if (r.url) {
+          pushJob(r.url, r.isVideo ? 'video' : 'image', u => {
+            setCards(prev => prev.map(x => {
+              if (x.id !== c.id || !x.results?.[i]) return x
+              const results = x.results.map((it, j) => (j === i ? { ...it, url: u } : it))
+              return { ...x, results, url: x.activeResultIndex === i ? u : x.url }
+            }))
+          })
+        }
+      })
+      if (c.ttsState?.resultUrl) pushJob(c.ttsState.resultUrl, 'audio', u => updateTtsState(c.id, { resultUrl: u }))
+      if (c.motionState?.resultUrl) pushJob(c.motionState.resultUrl, 'video', u => updateMotionState(c.id, { resultUrl: u }))
+      if (c.vsrState?.resultUrl) pushJob(c.vsrState.resultUrl, 'video', u => updateVsrState(c.id, { resultUrl: u }))
+    })
+    // 最多 3 路并发, 避免一次打开大量历史卡时打爆后端
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < jobs.length) {
+        const j = jobs[cursor]
+        cursor += 1
+        await j()
+      }
+    }
+    if (jobs.length) await Promise.all(Array.from({ length: Math.min(3, jobs.length) }, () => worker()))
+  }
+
+  /**
+   * 单张成品结果图「按需」裂图自愈: 仅当该图实际加载失败(onError)时, 凭结果项 taskId
+   * 从任务历史取回平台永久 CDN 地址替换。绝不在打开画布时批量改写健康的本地图片——
+   * 存量数据保持原样, 只有真坏的图才被救回, 且替换成功才触发一次正常自动保存。
+   * 同一 taskId 只查一次(含失败负缓存), 宫格/融合等无 taskId 的前端产物不在此列。
+   */
+  const healTriedRef = useRef<Set<string>>(new Set())
+  async function healResultImageByTask(cardId: string, index: number, taskId: string) {
+    if (!taskId || healTriedRef.current.has(taskId)) return
+    healTriedRef.current.add(taskId)
+    try {
+      const res = await fetch(`${getPocketBaseUrl()}/api/media/result-urls`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ taskIds: [taskId] }),
+      })
+      if (!res.ok) return
+      const data = (await res.json().catch(() => null)) as { urls?: Record<string, string> } | null
+      const durable = data?.urls?.[taskId]
+      if (!durable || !isDurableOutputMediaUrl(durable)) return
+      // 仅当该结果项当前仍指向同一条本地链接时才替换, 避免覆盖用户的更新操作
+      setCards(prev =>
+        prev.map(x => {
+          const item = x.id === cardId ? x.results?.[index] : undefined
+          if (!item || item.taskId !== taskId || !isPersistedMediaUrl(item.url)) return x
+          const results = x.results!.map((it, j) => (j === index ? { ...it, url: durable } : it))
+          return { ...x, results, ...(x.activeResultIndex === index ? { url: durable } : {}) }
+        }),
+      )
+    } catch {
+      // 自愈失败静默: 下次该图再触发 onError 时, 负缓存阻止重复请求; 不阻塞画布
+    }
+  }
+
   /** 对恢复出的待续轮询任务按渠道分流(初始加载与冲突后加载最新共用) */
   function resumeRestoredJobs(docCards: CanvasCardData[], pending: PendingJobRecord[], sessionToken: number) {
     if (!pending.length) return
@@ -1503,7 +1916,8 @@ export function useCanvas() {
     let active = true
     // 进入新画布: 换会话令牌并取消上一画布全部在轮询的任务, 杜绝旧任务回写新画布
     sessionTokenRef.current += 1
-    abortAllJobs()
+    jobAbortsRef.current.forEach(ac => ac.abort())
+    jobAbortsRef.current.clear()
     // 切换画布或刷新时先锁住自动保存，避免旧画布状态覆盖刚加载的内容。
     setDocLoaded(false)
     const sessionToken = sessionTokenRef.current
@@ -1511,11 +1925,6 @@ export function useCanvas() {
     const prevId = lastCanvasIdRef.current
     lastCanvasIdRef.current = canvasId
     if (prevId && prevId !== canvasId) flushPersistNow(prevId)
-    setActiveCanvasId(canvasId)
-    const targetViewport = documentStore.getState().viewport
-    viewportRef.current = targetViewport
-    panCommitRef.current = { x: targetViewport.x, y: targetViewport.y }
-    applyContentTransform(targetViewport)
     ;(async () => {
       try {
         const res = await fetch(`${CANVASES_API}/${canvasId}`, { headers: { ...getAuthHeaders() } })
@@ -1577,6 +1986,785 @@ export function useCanvas() {
     return () => {
       active = false
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasId])
+
+  // ---------- 自动保存: 串行单飞 + 最新快照合并 + 视图拆分 + 乐观锁 + 本地双写兜底 ----------
+  // 每次变化只在桶里标记 dirty, 实际请求严格串行; 上一笔完成后再取最新快照发送,
+  // 从机制上保证后发永远不早于先发; 后端按 canvas_data.rev 乐观锁再兜底一层。
+  // 全量内容在发送前同步写入 IndexedDB, 云端确认后删除: 崩溃/强杀/断网关机也能下次恢复。
+  const saveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  const saveInFlightRef = useRef<Record<string, boolean>>({})
+  const saveDirtyRef = useRef<Record<string, { full: boolean; view: boolean }>>({})
+  // 各画布「待同步内容是否已安全落本地盘」: 关页原生确认只在盘上也没有时才弹
+  const localSafeRef = useRef<Record<string, boolean>>({})
+  // 各画布是否有全量(内容)请求正在途中: 卸载瞬间 dirty 已被消费, 靠它判断内容风险
+  const inFlightFullRef = useRef<Record<string, boolean>>({})
+  // 各画布「下一笔全量保存强制覆盖乐观锁」一次性标记(崩溃恢复接管后使用)
+  const pendingForceRef = useRef<Record<string, boolean>>({})
+
+  /** 抠图 dataUrl 太大不落库(刷新按 genUrl 重算); 上传中的 blob: 链接刷新即失效, 临时清空 */
+  /**
+   * 组持久化卡片: 正在上传、url 还是 blob: 本地预览的卡, 用上一版已成功持久化的完整卡片快照顶替,
+   * 绝不能剥成空 url 写进全量文档覆盖云端(否则刷新后图片消失、卡片塌成 180 高)。
+   * 全新卡首次上传、尚无旧快照时, 用同 id 占位: 剥掉 blob url 但保留卡片骨架与位置,
+   * 上传完成后的下一次保存会带上永久链接(只此一次, 且不会覆盖任何已有图片)。
+   */
+  function buildPersistCards(srcCards: CanvasCardData[]): CanvasCardData[] {
+    return srcCards.map(c => {
+      let next = c
+      if (c.kind === 'layer' && c.layerState) {
+        next = { ...c, layerState: { ...c.layerState, layers: c.layerState.layers.map(l => ({ ...l, cutoutUrl: null })) } }
+      }
+      if (next.url && next.url.startsWith('blob:')) {
+        const prevMedia = lastPersistedMediaRef.current.get(c.id)
+        if (prevMedia) {
+          // 有上一版永久媒体: 保留旧的 url/results, 不被在途 blob 剥空, 位置/改名等字段取当前值
+          next = {
+            ...next,
+            url: prevMedia.url,
+            ...(prevMedia.results ? { results: prevMedia.results } : {}),
+          }
+        } else {
+          // 全新卡首次上传在途: 剥掉不可持久化的 blob, 骨架先入库; 永久链接随上传完成后的下一次保存写入
+          next = { ...next, url: '', jobStatus: next.jobStatus === 'running' ? 'queued' : next.jobStatus }
+        }
+      }
+      // 语音克隆: 上传中的 blob 本地链接不入库
+      if (next.kind === 'tts' && next.ttsState) {
+        const ts = { ...next.ttsState }
+        let dirty = false
+        if (ts.cloneAudioUrl?.startsWith('blob:')) { ts.cloneAudioUrl = undefined; ts.cloneAudioName = undefined; dirty = true }
+        if (ts.emotionRefAudioUrl?.startsWith('blob:')) { ts.emotionRefAudioUrl = undefined; ts.emotionRefAudioName = undefined; dirty = true }
+        if (ts.resultUrl?.startsWith('blob:')) { ts.resultUrl = undefined; dirty = true }
+        if (dirty) next = { ...next, ttsState: ts }
+      }
+      // 动作迁移: 上传中的 blob 本地链接不入库
+      if (next.kind === 'motion' && next.motionState) {
+        const ms = { ...next.motionState }
+        let motionDirty = false
+        if (ms.refImageUrl?.startsWith('blob:')) { ms.refImageUrl = undefined; ms.refImageName = undefined; motionDirty = true }
+        if (ms.refVideoUrl?.startsWith('blob:')) { ms.refVideoUrl = undefined; ms.refVideoName = undefined; ms.refVideoDuration = undefined; motionDirty = true }
+        if (ms.resultUrl?.startsWith('blob:')) { ms.resultUrl = undefined; motionDirty = true }
+        if (motionDirty) next = { ...next, motionState: ms }
+      }
+      // 视频高清修复: 上传中的 blob 本地链接不入库
+      if (next.kind === 'vsr' && next.vsrState) {
+        const vs = { ...next.vsrState }
+        let vsrDirty = false
+        if (vs.videoUrl?.startsWith('blob:')) { vs.videoUrl = undefined; vs.videoName = undefined; vs.videoDuration = undefined; vsrDirty = true }
+        if (vs.resultUrl?.startsWith('blob:')) { vs.resultUrl = undefined; vsrDirty = true }
+        if (vsrDirty) next = { ...next, vsrState: vs }
+      }
+      return next
+    })
+  }
+
+  /** 排掉某画布的待发主动重试定时器 */
+  function clearRetryTimer(id: string) {
+    if (retryTimerRef.current[id]) {
+      clearTimeout(retryTimerRef.current[id])
+      delete retryTimerRef.current[id]
+    }
+  }
+
+  /** 失败后按指数退避安排一次主动重试(1s→3s→10s→30s→60s 封顶, ±20% 抖动), 无需用户再操作 */
+  function scheduleRetry(targetCanvasId: string) {
+    if (retryTimerRef.current[targetCanvasId]) return
+    if (saveConflictRef.current?.canvasId === targetCanvasId) return
+    const step = Math.min(retryStepRef.current[targetCanvasId] ?? 0, RETRY_BACKOFF_MS.length - 1)
+    const base = RETRY_BACKOFF_MS[step]
+    retryStepRef.current[targetCanvasId] = step + 1
+    const jitter = base * 0.2 * (2 * Math.random() - 1)
+    retryTimerRef.current[targetCanvasId] = setTimeout(() => {
+      delete retryTimerRef.current[targetCanvasId]
+      const marks = saveDirtyRef.current[targetCanvasId]
+      if (!marks?.full && !marks?.view) return
+      if (navigator.onLine === false) return // online 事件会再触发
+      void sendPersist(targetCanvasId)
+    }, Math.max(300, base + jitter))
+  }
+
+  /** 全量内容在发云端前先落本地盘; 失败返回 false(顶栏不能显示「本地已存」) */
+  async function writeLocalSnapshotBeforeSend(targetCanvasId: string, baseRev: number, doc: CanvasDoc, title: string): Promise<boolean> {
+    try {
+      const snap: LocalCanvasSnapshot = {
+        rev: baseRev,
+        title,
+        doc: doc as unknown as Record<string, unknown>,
+        savedAt: Date.now(),
+        sessionId: browserSessionIdRef.current,
+      }
+      return await putLocalSnapshot(targetCanvasId, browserSessionIdRef.current, snap)
+    } catch {
+      return false
+    }
+  }
+
+  async function sendPersist(targetCanvasId: string, opts?: { keepalive?: boolean; force?: boolean }) {
+    const bucket = docBucketsRef.current[targetCanvasId]
+    if (!bucket) return
+    const marks = saveDirtyRef.current[targetCanvasId]
+    if (!marks || (!marks.full && !marks.view)) return
+    // 单飞: 同一画布同一时刻只有一个在途 PATCH, 完成后检查 dirty 决定是否补发最新快照
+    if (saveInFlightRef.current[targetCanvasId]) return
+    // 冲突挂起/恢复弹窗未决时不自动发, 避免覆盖别处新版本或打断用户选择
+    if (saveConflictRef.current?.canvasId === targetCanvasId) return
+    if (localRestoreRef.current?.canvasId === targetCanvasId) return
+    saveInFlightRef.current[targetCanvasId] = true
+    const wantFull = marks.full
+    const wantView = marks.view
+    const wantForce = !!opts?.force || !!pendingForceRef.current[targetCanvasId]
+    if (wantForce) pendingForceRef.current[targetCanvasId] = false
+    if (wantFull) inFlightFullRef.current[targetCanvasId] = true
+    if (targetCanvasId === canvasId) armSavingFlash(targetCanvasId)
+    saveDirtyRef.current[targetCanvasId] = { full: false, view: false }
+    const baseRev = bucket.rev || 0
+    let localLanded = false
+    let fullDoc: CanvasDoc | null = null
+    if (wantFull) {
+      // 全量保存携带当时最新视图; 版本号(rev)由服务端统一分配, 这里只传基线供乐观锁校验
+      fullDoc = {
+        version: 1,
+        cards: buildPersistCards(bucket.cards),
+        connections: bucket.connections,
+        view: bucket.viewport,
+        pendingJobs: bucket.pending,
+        projectAssets: bucket.projectAssets,
+        logs: bucket.logs.slice(0, 500),
+      }
+      // 先落本地兜底盘再排队等云槽: 等槽期间页面被终止也不丢(崩溃恢复的唯一来源)
+      localLanded = await writeLocalSnapshotBeforeSend(targetCanvasId, baseRev, fullDoc, bucket.title)
+      localSafeRef.current[targetCanvasId] = localSafeRef.current[targetCanvasId] || localLanded
+    }
+    // 全局并发槽: 卸载抢发不排队, 平时多画布最多 2 笔在途
+    const releaseSlot = opts?.keepalive ? tryAcquireCloudSlot() : await acquireCloudSlot()
+    // 序列化一次: 同时拿到请求体大小(keepalive 64KB 判定)与内容指纹(幂等键)
+    let body: Record<string, unknown>
+    if (wantFull) {
+      body = {
+        title: bucket.title,
+        canvas_data: fullDoc,
+        canvas_rev: baseRev,
+        // 409 冲突后用户显式选择「用我的版本覆盖」时带上, 服务端跳过基线校验但仍自增 rev
+        ...(wantForce ? { canvas_force: true } : {}),
+      }
+    } else {
+      // 纯视图变化(平移/缩放)只发视图, 不重写画布内容, 避免拖动画布也产生整文档写入
+      body = {
+        canvas_data: { view: bucket.viewport },
+        canvas_view_only: true,
+        canvas_rev: baseRev,
+      }
+    }
+    const bodyText = JSON.stringify(body)
+    // 幂等键: 按内容指纹生成, 同内容网络重试复用(服务端命中回放, 消除响应丢失导致的伪 409);
+    // force 覆盖与纯视角不幂等(语义上每次都应真实处理)
+    const idemKey = wantFull && !wantForce ? `c-${cyrb53Hex(bodyText)}` : ''
+    // 卸载路径 + 全量体超过 keepalive 上限: 浏览器会静默丢弃, 不强发。
+    // 页面仍存活(SPA 路由离开)时 1.2s 后走普通请求补发; 真正终止时靠本地快照下次打开恢复。
+    if (opts?.keepalive && wantFull && bodyText.length > KEEPALIVE_BODY_LIMIT) {
+      const cur3 = saveDirtyRef.current[targetCanvasId] || { full: false, view: false }
+      cur3.full = true
+      saveDirtyRef.current[targetCanvasId] = cur3
+      if (!retryTimerRef.current[targetCanvasId]) {
+        retryTimerRef.current[targetCanvasId] = setTimeout(() => {
+          delete retryTimerRef.current[targetCanvasId]
+          void sendPersist(targetCanvasId)
+        }, 1200)
+      }
+      if (targetCanvasId === canvasId) setSaveState(localSafeRef.current[targetCanvasId] ? 'local' : 'error')
+      return
+    }
+    let res: Response
+    try {
+      res = await fetch(`${CANVASES_API}/${targetCanvasId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+          ...(idemKey ? { 'X-Idempotency-Key': idemKey } : {}),
+        },
+        body: bodyText,
+        keepalive: !!opts?.keepalive,
+      })
+    } catch (netErr) {
+      // 统一落到下面的 catch 处理(重试/本地态), 这里不重复 finally 清理逻辑
+      throw netErr
+    }
+    try {
+      if (res.ok) {
+        const updated = (await res.json().catch(() => null)) as { canvas_data?: { rev?: number } } | null
+        const serverRev = Number(updated?.canvas_data?.rev ?? 0)
+        const b = docBucketsRef.current[targetCanvasId]
+        // 只增不减(同上, 防止任何晚到响应把基线拉回旧版本)
+        if (b && serverRev > b.rev) b.rev = serverRev
+        clearRetryTimer(targetCanvasId)
+        retryStepRef.current[targetCanvasId] = 0
+        // 云端确认: 内容快照已无用, 清本地盘
+        if (wantFull) {
+          void clearLocalSnapshot(targetCanvasId, browserSessionIdRef.current)
+          localSafeRef.current[targetCanvasId] = false
+          // 通知同浏览器其它标签页: 云端有新版本了
+          postCanvasMessage({ type: 'canvas-saved', canvasId: targetCanvasId, rev: serverRev, fromSession: browserSessionIdRef.current })
+        }
+        if (targetCanvasId === canvasId) {
+          const stillDirty = saveDirtyRef.current[targetCanvasId]
+          setSaveState(stillDirty?.full || stillDirty?.view ? 'saving' : 'saved')
+        }
+      } else if (res.status === 409) {
+        // 内容保存版本冲突(多标签/多设备同开)。绝不再用本地旧快照自动重放 —— 那会静默覆盖别处的新内容。
+        // 保留本次改动(重标 dirty, 基线不前移到新版本, 否则会被当成最新而误覆盖),
+        // 弹出冲突选择让用户决定「加载最新 / 强制覆盖」。
+        let serverRev = 0
+        try {
+          const conflict = (await res.json().catch(() => null)) as { canvas_rev?: number } | null
+          serverRev = Number(conflict?.canvas_rev ?? 0) || 0
+        } catch {
+          /* 忽略冲突体解析失败 */
+        }
+        const cur = saveDirtyRef.current[targetCanvasId] || { full: false, view: false }
+        if (wantFull) cur.full = true
+        if (wantView && !wantFull) cur.view = true
+        saveDirtyRef.current[targetCanvasId] = cur
+        if (wantFull) localSafeRef.current[targetCanvasId] = localSafeRef.current[targetCanvasId] || localLanded
+        clearRetryTimer(targetCanvasId)
+        if (targetCanvasId === canvasId && wantFull) {
+          setSaveState('conflict')
+          setSaveConflict(prev => prev ?? { canvasId: targetCanvasId, serverRev })
+        }
+      } else if (res.status === 401 || res.status === 403 || res.status === 404 || res.status === 412) {
+        // 登录过期/失效: 改动必须留住待登录后续存, 顶栏标红并弹登录, 不能只悄悄置一个灰字。
+        // 本地已落盘的内容显示「本地已存·待同步」, 让用户知道崩溃也不丢; 不落盘才是失败红标。
+        const cur = saveDirtyRef.current[targetCanvasId] || { full: false, view: false }
+        if (wantFull) cur.full = true
+        if (wantView && !wantFull) cur.view = true
+        saveDirtyRef.current[targetCanvasId] = cur
+        if (wantFull) localSafeRef.current[targetCanvasId] = localSafeRef.current[targetCanvasId] || localLanded
+        clearRetryTimer(targetCanvasId)
+        if (targetCanvasId === canvasId) {
+          setSaveState(wantFull && localSafeRef.current[targetCanvasId] ? 'local' : 'error')
+          setAuthDialog('login')
+          toast.error('登录已过期, 改动尚未同步, 请重新登录后会自动续存')
+        }
+      } else {
+        // 其它 5xx/400: 保留改动, 进入指数退避主动重试, 顶栏按本地落盘情况区分状态
+        const cur2 = saveDirtyRef.current[targetCanvasId] || { full: false, view: false }
+        if (wantFull) cur2.full = true
+        if (wantView && !wantFull) cur2.view = true
+        saveDirtyRef.current[targetCanvasId] = cur2
+        if (wantFull) localSafeRef.current[targetCanvasId] = localSafeRef.current[targetCanvasId] || localLanded
+        if (targetCanvasId === canvasId) {
+          setSaveState(wantFull && localSafeRef.current[targetCanvasId] ? 'local' : 'error')
+        }
+        scheduleRetry(targetCanvasId)
+      }
+    } catch {
+      // 网络失败: 重新标记待保存, 指数退避主动重试 + online 事件双保险, 不丢改动
+      const cur = saveDirtyRef.current[targetCanvasId] || { full: false, view: false }
+      if (wantFull) cur.full = true
+      if (wantView && !wantFull) cur.view = true
+      saveDirtyRef.current[targetCanvasId] = cur
+      if (wantFull) localSafeRef.current[targetCanvasId] = localSafeRef.current[targetCanvasId] || localLanded
+      if (targetCanvasId === canvasId) {
+        setSaveState(wantFull && localSafeRef.current[targetCanvasId] ? 'local' : 'error')
+      }
+      scheduleRetry(targetCanvasId)
+    } finally {
+      releaseSlot()
+      saveInFlightRef.current[targetCanvasId] = false
+      if (wantFull) delete inFlightFullRef.current[targetCanvasId]
+      // 链式补发会重新 arm 闪烁定时器; 终态(成功/冲突)则取消, 避免已保存后闪一下「同步中」
+      const stillDirty = !!(saveDirtyRef.current[targetCanvasId]?.full || saveDirtyRef.current[targetCanvasId]?.view)
+      if (!stillDirty) cancelSavingFlash()
+      // 409 冲突已挂起等用户选择时, 绝不自动补发(否则又用旧快照覆盖); 其余情况有待发改动则串行补发最新快照
+      if (saveConflictRef.current?.canvasId === targetCanvasId) return
+      if (localRestoreRef.current?.canvasId === targetCanvasId) return
+      if (stillDirty) void sendPersist(targetCanvasId)
+    }
+  }
+
+  /** 立即把防抖中未落库的改动发出去(切画布/卸载前调用) */
+  function flushPersistNow(targetCanvasId?: string) {
+    const id = targetCanvasId ?? canvasId
+    if (!id) return
+    if (saveTimerRef.current[id]) {
+      clearTimeout(saveTimerRef.current[id])
+      delete saveTimerRef.current[id]
+    }
+    // 冲突挂起时不允许普通 flush 覆盖, 必须用户先做选择
+    if (saveConflictRef.current?.canvasId === id) return
+    void sendPersist(id)
+  }
+
+  function focusAgentNode(nodeId: string) {
+    const card = cardsRef.current.find(item => item.id === nodeId)
+    if (!card) return
+    setSelectedIds([nodeId])
+    frameCards([card])
+  }
+
+  async function prepareAgentTurn() {
+    const id = canvasId
+    const token = sessionTokenRef.current
+    if (!id || !docLoaded) throw new Error('画布尚未加载')
+    flushPersistNow(id)
+    const deadline = Date.now() + 15000
+    // A UI save label is not a receipt; inspect the persistence queue itself.
+    while (Date.now() < deadline) {
+      if (sessionTokenRef.current !== token) throw new Error('画布已切换')
+      if (saveConflictRef.current || localRestoreRef.current) throw new Error('请先处理画布版本冲突')
+      const dirty = saveDirtyRef.current[id]
+      if (!dirty?.full && !dirty?.view && !saveInFlightRef.current[id] && !saveTimerRef.current[id]) return
+      await new Promise(resolve => setTimeout(resolve, 80))
+    }
+    throw new Error('画布尚未同步，请稍后发送')
+  }
+
+  async function syncAgentRevision(revision: number) {
+    const id = canvasId
+    const token = sessionTokenRef.current
+    if (!id || !docLoaded) return
+    const before = docBucketsRef.current[id]
+    if (!before || before.rev >= revision) return
+    const conflict = () => {
+      setSaveState('conflict')
+      setSaveConflict(prev => prev ?? { canvasId: id, serverRev: revision })
+    }
+    const dirty = saveDirtyRef.current[id]
+    if (dirty?.full || dirty?.view || saveInFlightRef.current[id] || saveTimerRef.current[id]) { conflict(); return }
+    const res = await fetch(`${CANVASES_API}/${id}`, { headers: { ...getAuthHeaders() } })
+    if (!res.ok) throw new Error('画布更新读取失败')
+    const rec = await res.json()
+    if (sessionTokenRef.current !== token) return
+    const now = docBucketsRef.current[id]
+    const dirtyNow = saveDirtyRef.current[id]
+    if (saveConflictRef.current || localRestoreRef.current || dirtyNow?.full || dirtyNow?.view || saveInFlightRef.current[id] || saveTimerRef.current[id] || now?.cards !== before.cards || now?.connections !== before.connections) { conflict(); return }
+    if ((Number(rec.canvas_data?.rev) || 0) < (now?.rev || 0)) return
+    applyServerDoc(rec, id, token, { suppressSave: true })
+  }
+
+  /** 冲突选择一: 加载别处已保存的最新版; 本地未同步改动先备份, 提供一次「取回我的版本」 */
+  async function resolveConflictReload() {
+    const conflict = saveConflictRef.current
+    setSaveConflict(null)
+    if (!conflict) return
+    const id = conflict.canvasId
+    // 覆盖前把本地待发内容备份一份(只保留最近一次), 误选后可取回
+    const hadLocalChanges = !!(saveDirtyRef.current[id]?.full || saveDirtyRef.current[id]?.view)
+    if (hadLocalChanges) {
+      const b = docBucketsRef.current[id]
+      if (b) {
+        try {
+          await putConflictBackup(id, {
+            rev: b.rev || 0,
+            title: b.title,
+            doc: {
+              version: 1,
+              cards: buildPersistCards(b.cards),
+              connections: b.connections,
+              view: b.viewport,
+              pendingJobs: b.pending,
+              projectAssets: b.projectAssets,
+              logs: b.logs.slice(0, 500),
+            },
+            savedAt: Date.now(),
+            sessionId: browserSessionIdRef.current,
+            serverRev: conflict.serverRev,
+            backedAt: Date.now(),
+          })
+          setConflictBackupAvailable(true)
+        } catch {
+          /* 备份失败不阻断「加载最新」主流程 */
+        }
+      }
+    }
+    // 丢弃本地待发内容改动
+    saveDirtyRef.current[id] = { full: false, view: false }
+    localSafeRef.current[id] = false
+    clearRetryTimer(id)
+    try {
+      const res = await fetch(`${CANVASES_API}/${id}`, { headers: { ...getAuthHeaders() } })
+      if (!res.ok) throw new Error('reload failed')
+      const rec = await res.json()
+      if (id !== canvasId) return
+      const { docCards, pending } = applyServerDoc(rec, id, sessionTokenRef.current, { suppressSave: true })
+      setDocLoaded(true)
+      resumeRestoredJobs(docCards, pending, sessionTokenRef.current)
+      setSaveState('saved')
+      toast.success(hadLocalChanges ? '已加载最新版本, 本地改动已保留, 顶栏可取回' : '已加载最新版本')
+    } catch {
+      // 拉取失败: 保留冲突态让用户可重试, 不静默
+      setSaveConflict({ canvasId: id, serverRev: conflict.serverRev })
+      toast.error('加载最新版本失败, 请检查网络后重试')
+    }
+  }
+
+  /** 冲突误选撤销: 取出刚才备份的本地版本并强制覆盖回去(只保留一次机会) */
+  async function restoreConflictBackup() {
+    const id = lastCanvasIdRef.current || canvasId
+    if (!id) return
+    const backup = await takeConflictBackup(id)
+    if (!backup) {
+      toast.error('没有可取回的本地版本')
+      return
+    }
+    setConflictBackupAvailable(false)
+    const rec = { title: backup.title, canvas_data: backup.doc }
+    const { docCards, pending } = applyServerDoc(rec, id, sessionTokenRef.current, { suppressSave: true })
+    setDocLoaded(true)
+    resumeRestoredJobs(docCards, pending, sessionTokenRef.current)
+    const b = docBucketsRef.current[id]
+    if (b && backup.serverRev > b.rev) b.rev = backup.serverRev
+    saveDirtyRef.current[id] = { full: true, view: false }
+    if (saveTimerRef.current[id]) {
+      clearTimeout(saveTimerRef.current[id])
+      delete saveTimerRef.current[id]
+    }
+    setSaveState('saving')
+    void sendPersist(id, { force: true })
+    toast.success('已取回你的本地版本, 正在覆盖同步')
+  }
+
+  function dismissConflictBackup() {
+    setConflictBackupAvailable(false)
+  }
+
+  /** 崩溃恢复选择一: 以云端为准, 丢弃本地快照(同时清掉同画布其它陈旧快照) */
+  async function discardLocalRestore() {
+    const r = localRestoreRef.current
+    if (!r) return
+    setLocalRestore(null)
+    const { canvasId: id, originSessionId } = r
+    await deleteStaleSnapshot(id, originSessionId)
+    // 同画布若还残留别的崩溃标签页快照, 一并清掉, 避免下次打开再弹
+    const rest = await listStaleSnapshots(id, browserSessionIdRef.current)
+    for (const s of rest) await deleteStaleSnapshot(id, s.originSessionId)
+    // 内存里已灌的是云端文档, 补续它携带的生成任务轮询
+    const cloudCards = cardsRef.current
+    resumeRestoredJobs(cloudCards, cloudPendingAtRestoreRef.current, sessionTokenRef.current)
+    cloudPendingAtRestoreRef.current = []
+    setSaveState('saved')
+    toast.success('已使用云端最新版本, 本地未同步内容已清除')
+  }
+
+  /**
+   * 崩溃恢复选择二: 把本地快照灌入画布, 随后走常规防抖保存(带 force,
+   * 快照基线可能落后云端, 属于用户显式选择覆盖)。
+   */
+  function acceptLocalRestore() {
+    const r = localRestoreRef.current
+    if (!r) return
+    const { canvasId: id, snapshot, originSessionId } = r
+    setLocalRestore(null)
+    cloudPendingAtRestoreRef.current = []
+    const { docCards, pending } = applyServerDoc(
+      { title: snapshot.title, canvas_data: snapshot.doc },
+      id,
+      sessionTokenRef.current,
+      // 不抑制保存 effect: 灌入后让常规防抖链路在 900ms 后自动发最新桶, 避开时序依赖
+    )
+    resumeRestoredJobs(docCards, pending, sessionTokenRef.current)
+    pendingForceRef.current[id] = true
+    localSafeRef.current[id] = true
+    // 接管后该快照归当前会话所有: 旧会话键删除, 正常保存成功后会清当前会话键
+    void deleteStaleSnapshot(id, originSessionId)
+    toast.success('已恢复未保存的改动, 稍后将自动同步到云端')
+  }
+
+  /** 崩溃恢复弹窗挂起期间不做选择, 快照留在本机下次再问 */
+  function deferLocalRestore() {
+    setLocalRestore(null)
+    cloudPendingAtRestoreRef.current = []
+    setSaveState('local')
+    toast.message('未保存的改动仍保留在本机, 下次打开这个画布可再次选择恢复')
+  }
+
+  /** 冲突选择二: 用本地版本强制覆盖别处的新内容(用户显式确认, 服务端 canvas_force 跳过基线校验) */
+  function resolveConflictOverwrite() {
+    const conflict = saveConflictRef.current
+    setSaveConflict(null)
+    if (!conflict) return
+    const id = conflict.canvasId
+    // 把本地基线对齐到服务端 rev, 再带 force 发一次最新全量
+    const b = docBucketsRef.current[id]
+    if (b && conflict.serverRev > b.rev) b.rev = conflict.serverRev
+    saveDirtyRef.current[id] = { full: true, view: false }
+    if (saveTimerRef.current[id]) {
+      clearTimeout(saveTimerRef.current[id])
+      delete saveTimerRef.current[id]
+    }
+    setSaveState('saving')
+    void sendPersist(id, { force: true })
+  }
+
+  // 「同步中」字样延迟显示: 请求 300ms 内完成不切换状态, 避免快速保存时顶栏频闪
+  const savingFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  function armSavingFlash(id: string) {
+    if (savingFlashTimerRef.current) clearTimeout(savingFlashTimerRef.current)
+    savingFlashTimerRef.current = setTimeout(() => {
+      savingFlashTimerRef.current = null
+      if (saveInFlightRef.current[id] && id === canvasId && !saveConflictRef.current) setSaveState('saving')
+    }, 300)
+  }
+  function cancelSavingFlash() {
+    if (savingFlashTimerRef.current) {
+      clearTimeout(savingFlashTimerRef.current)
+      savingFlashTimerRef.current = null
+    }
+  }
+
+  /**
+   * 动态防抖时长:
+   * - 视图拖动 0.6s, 不受规模影响(请求体很小);
+   * - 内容保存按画布卡片数(120/400 两档)与网络信息(saveData/弱网 rtt)在 0.9–1.5s 浮动,
+   *   小画布好网最低 0.6s, 让大画布弱网下少排队、少发大请求。
+   */
+  function saveDebounceMs(kind: 'full' | 'view', cardCount: number): number {
+    if (kind === 'view') return 600
+    let delay = 900
+    if (cardCount > 400) delay += 500
+    else if (cardCount > 120) delay += 250
+    try {
+      const conn = (navigator as Navigator & { connection?: { saveData?: boolean; rtt?: number } }).connection
+      if (conn?.saveData || (typeof conn?.rtt === 'number' && conn.rtt >= 400)) delay = Math.min(1500, delay + 300)
+    } catch {
+      /* 无网络信息用默认 */
+    }
+    if (cardCount <= 30) delay = Math.min(delay, 600)
+    return delay
+  }
+
+  function scheduleSave(kind: 'full' | 'view') {
+    if (!docLoaded || !canvasId) return
+    // 崩溃恢复弹窗未决: 改动标记照常累积, 但不抢状态、不调度发送(用户选择后再发)
+    if (localRestoreRef.current?.canvasId === canvasId) return
+    const marks = saveDirtyRef.current[canvasId] || { full: false, view: false }
+    if (kind === 'full') marks.full = true
+    else if (!marks.full) marks.view = true
+    saveDirtyRef.current[canvasId] = marks
+    // 冲突弹窗挂起期间继续累积改动, 但不抢状态、不调度发送(用户选择后再发最新快照)
+    if (saveConflictRef.current?.canvasId === canvasId) return
+    // 用户有新操作: 退避重试从 1s 重新起步
+    clearRetryTimer(canvasId)
+    retryStepRef.current[canvasId] = 0
+    setSaveState('editing')
+    if (saveTimerRef.current[canvasId]) clearTimeout(saveTimerRef.current[canvasId])
+    const delay = saveDebounceMs(kind === 'view' && !marks.full ? 'view' : 'full', cardsRef.current.length)
+    saveTimerRef.current[canvasId] = setTimeout(() => {
+      delete saveTimerRef.current[canvasId]
+      void sendPersist(canvasId)
+    }, delay)
+  }
+
+  // 内容变化: 全量保存(程序灌入服务端文档的一拍跳过, 避免打开/同步后无意义回存)
+  useEffect(() => {
+    if (suppressContentSaveRef.current > 0) {
+      suppressContentSaveRef.current -= 1
+      return
+    }
+    scheduleSave('full')
+    return () => {
+      if (canvasId && saveTimerRef.current[canvasId]) {
+        clearTimeout(saveTimerRef.current[canvasId])
+        delete saveTimerRef.current[canvasId]
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cards, connections, canvasTitle, pendingJobs, genLogs, projectAssets, docLoaded, canvasId])
+
+  // 视图变化(平移/缩放): 只保存视图(程序灌入服务端文档的一拍跳过)
+  useEffect(() => {
+    if (suppressViewSaveRef.current > 0) {
+      suppressViewSaveRef.current -= 1
+      return
+    }
+    scheduleSave('view')
+    return () => {
+      if (canvasId && saveTimerRef.current[canvasId]) {
+        clearTimeout(saveTimerRef.current[canvasId])
+        delete saveTimerRef.current[canvasId]
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewport, docLoaded, canvasId])
+
+  // 卸载路径专用: 不等防抖, 直接把当前最新全量快照写入本地盘(崩溃恢复的兜底来源)
+  async function dumpLocalSnapshotNow(id: string): Promise<boolean> {
+    const b = docBucketsRef.current[id]
+    if (!b) return false
+    try {
+      const ok = await writeLocalSnapshotBeforeSend(
+        id,
+        b.rev || 0,
+        {
+          version: 1,
+          cards: buildPersistCards(b.cards),
+          connections: b.connections,
+          view: b.viewport,
+          pendingJobs: b.pending,
+          projectAssets: b.projectAssets,
+          logs: b.logs.slice(0, 500),
+        } as CanvasDoc,
+        b.title,
+      )
+      if (ok) localSafeRef.current[id] = true
+      return ok
+    } catch {
+      return false
+    }
+  }
+
+  // 关页/切后台/切画布多通道保存, 尽量消除最后几笔改动的丢失窗口(读 ref, 不依赖首次渲染闭包):
+  //  - visibilitychange=hidden(切后台/最小化/移动端切 App, 关页前大多先触发): 页面尚未终止,
+  //    先把最新全量快照写本地盘, 再用普通 fetch 提前 flush(不受 keepalive 64KB 限制);
+  //  - pagehide(关标签/跳走): 发起本地写盘后再补一笔 keepalive(≤64KB 请求浏览器卸载后继续发完),
+  //    发不出去也有盘上快照, 下次打开提示恢复;
+  //  - React cleanup(SPA 内路由离开, 如返回首页): 先落盘再 keepalive。
+  // 冲突挂起中不强发(避免覆盖别处的新版本)。
+  useEffect(() => {
+    function clearTimers() {
+      Object.keys(saveTimerRef.current).forEach(id => {
+        if (saveTimerRef.current[id]) clearTimeout(saveTimerRef.current[id])
+      })
+      Object.keys(retryTimerRef.current).forEach(id => {
+        if (retryTimerRef.current[id]) clearTimeout(retryTimerRef.current[id])
+      })
+    }
+    function targetId() {
+      return lastCanvasIdRef.current
+    }
+    function marksOf(id: string | null) {
+      if (!id) return null
+      if (saveConflictRef.current?.canvasId === id) return null
+      return saveDirtyRef.current[id] ?? null
+    }
+    async function onHidden() {
+      const id = targetId()
+      const m = marksOf(id)
+      if (!id || !m || (!m.full && !m.view)) return
+      clearTimers()
+      // 防抖窗口里的最新内容先落盘(hidden 后页面通常不会立刻终止, 事务来得及完成)
+      if (m.full && !localSafeRef.current[id]) await dumpLocalSnapshotNow(id)
+      void sendPersist(id)
+    }
+    function onPageHide() {
+      const id = targetId()
+      const m = marksOf(id)
+      if (!id || !m || (!m.full && !m.view)) return
+      clearTimers()
+      if (m.full && !localSafeRef.current[id]) void dumpLocalSnapshotNow(id)
+      void sendPersist(id, { keepalive: true })
+    }
+    document.addEventListener('visibilitychange', onHidden)
+    window.addEventListener('pagehide', onPageHide)
+    return () => {
+      document.removeEventListener('visibilitychange', onHidden)
+      window.removeEventListener('pagehide', onPageHide)
+      clearTimers()
+      const lastId = lastCanvasIdRef.current
+      const m = lastId ? marksOf(lastId) : null
+      if (!lastId || !m || (!m.full && !m.view)) return
+      // SPA 内路由离开: JS 环境仍存活, 先落盘再抢发
+      if (m.full && !localSafeRef.current[lastId]) {
+        void dumpLocalSnapshotNow(lastId).then(ok => {
+          if (ok) void sendPersist(lastId, { keepalive: true })
+        })
+      } else {
+        void sendPersist(lastId, { keepalive: true })
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 关页原生拦截只在「内容有丢失风险」时弹: 内容待发/全量在途且本地盘也没有, 或冲突待选择。
+  // 本地已存(断网也能恢复)、纯视角变化、已保存、空闲均不打扰。
+  useEffect(() => {
+    const id = canvasId
+    function onBeforeUnload(ev: BeforeUnloadEvent) {
+      if (!id) return
+      if (saveConflictRef.current?.canvasId === id) {
+        ev.preventDefault()
+        ev.returnValue = '画布存在待处理的版本冲突, 确定离开吗?'
+        return
+      }
+      if (localRestoreRef.current) return
+      const m = saveDirtyRef.current[id]
+      const contentAtRisk = (!!m?.full || inFlightFullRef.current[id]) && !localSafeRef.current[id]
+      // 有文件仍在上传: 全新卡首传若此刻终止, 永久链接还没写回, 再进来就是无图空卡
+      const uploadInFlight = getMediaUploadInflight() > 0
+      if (contentAtRisk || uploadInFlight) {
+        ev.preventDefault()
+        ev.returnValue = uploadInFlight
+          ? '图片还在上传中, 现在离开可能丢失图片, 确定离开吗?'
+          : '有改动尚未保存, 确定离开吗?'
+      }
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+    // 回调内全部读 ref, 只随画布 id 挂一次: 旧依赖每次编辑/任务回写都重订阅一次监听
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasId])
+
+  // 网络恢复 / 定时退避双保险: 从离线回到在线, 立刻把所有画布的待发改动补发一次
+  useEffect(() => {
+    function onOnline() {
+      Object.keys(saveDirtyRef.current).forEach(id => {
+        const m = saveDirtyRef.current[id]
+        if (!m || (!m.full && !m.view)) return
+        if (saveConflictRef.current?.canvasId === id) return
+        if (localRestoreRef.current?.canvasId === id) return
+        if (saveInFlightRef.current[id]) return
+        clearRetryTimer(id)
+        retryStepRef.current[id] = 0
+        if (saveTimerRef.current[id]) {
+          clearTimeout(saveTimerRef.current[id])
+          delete saveTimerRef.current[id]
+        }
+        void sendPersist(id)
+      })
+    }
+    window.addEventListener('online', onOnline)
+    return () => window.removeEventListener('online', onOnline)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 同浏览器多标签协同: 别的标签保存了同一画布——
+  // 本标签没有未同步改动就静默拉到最新(消掉绝大多数保存时 409); 有未同步改动则提前弹出冲突选择。
+  useEffect(() => {
+    return onCanvasMessage(msg => {
+      if (msg.type !== 'canvas-saved' || msg.canvasId !== canvasId) return
+      if (msg.fromSession === browserSessionIdRef.current) return
+      if (saveConflictRef.current || localRestoreRef.current) return
+      const b = docBucketsRef.current[canvasId]
+      if (!b) return
+      // 版本不新于本地基线: 旧消息/自己的回声, 忽略
+      if (msg.rev && b.rev >= msg.rev) return
+      const m = saveDirtyRef.current[canvasId]
+      const pendingLocal = !!(m?.full || m?.view) || !!saveTimerRef.current[canvasId] || saveInFlightRef.current[canvasId]
+      if (pendingLocal) {
+        // 本地有未同步内容且云端已被别的标签推进: 提前挂冲突, 不等保存时才发现
+        if (!saveInFlightRef.current[canvasId]) {
+          setSaveState('conflict')
+          setSaveConflict(prev => prev ?? { canvasId, serverRev: msg.rev || b.rev + 1 })
+        }
+        return
+      }
+      // 本地干净: 静默同步
+      void (async () => {
+        try {
+          const res = await fetch(`${CANVASES_API}/${canvasId}`, { headers: { ...getAuthHeaders() } })
+          if (!res.ok) return
+          const rec = await res.json()
+          if (saveConflictRef.current || localRestoreRef.current) return
+          const m2 = saveDirtyRef.current[canvasId]
+          if (m2?.full || m2?.view || saveTimerRef.current[canvasId]) return
+          applyServerDoc(rec, canvasId, sessionTokenRef.current, { suppressSave: true })
+        } catch {
+          /* 静默同步失败不打扰, 乐观锁在保存时兜底 */
+        }
+      })()
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canvasId])
 
@@ -1962,7 +3150,7 @@ export function useCanvas() {
 
   /** 扫当前画布摄影机名, 取第一个未用的 A-Z 字母 */
   function nextUnusedCameraLetter(): string {
-    return nextCameraLetter(documentStore.getState().cards.filter(c => c.kind === 'camera').map(c => c.title ?? ''))
+    return nextCameraLetter(cardsRef.current.filter(c => c.kind === 'camera').map(c => c.title ?? ''))
   }
 
   /** 双击菜单创建摄影机: 自动命名 摄影机A/B/C, 配置取本机默认, 不连线不可运行 */
@@ -2022,7 +3210,7 @@ export function useCanvas() {
   function resolveCameraPrompt(card: CanvasCardData): string {
     if (card.kind !== 'generate') return ''
     if (card.cameraNodeId) {
-      const cam = documentStore.getState().cards.find(c => c.id === card.cameraNodeId && c.kind === 'camera')
+      const cam = cardsRef.current.find(c => c.id === card.cameraNodeId && c.kind === 'camera')
       if (cam) return buildCameraPromptFromConfig(cam.cameraState ?? DEFAULT_CAMERA_CONFIG)
     }
     return card.cameraSnapshot?.prompt ?? ''
@@ -2083,7 +3271,7 @@ export function useCanvas() {
       : { emotionRefAudioUrl: localUrl, emotionRefAudioName: localName })
     try {
       const url = await persistMedia(file, 'audio')
-      const cur = documentStore.getState().cards.find(c => c.id === cardId)
+      const cur = cardsRef.current.find(c => c.id === cardId)
       if (!cur) return
       updateTtsState(cardId, slot === 'clone'
         ? { cloneAudioUrl: url, cloneAudioName: localName }
@@ -2139,7 +3327,7 @@ export function useCanvas() {
       if (aliveForSession(token)) updateTtsState(cardId, patch)
     }
     try {
-      const startCard = documentStore.getState().cards.find(c => c.id === cardId)
+      const startCard = cardsRef.current.find(c => c.id === cardId)
       const start = startCard?.ttsState
       if (!start) return
       // 克隆人声/情绪参考是音频, 日志不展示「参考图」行(请求参数详情里仍可查看文件名)
@@ -2186,7 +3374,7 @@ export function useCanvas() {
           const resultUrl = url
           void persistRemoteImage(resultUrl, 'audio').then(permanent => {
             if (!permanent || permanent === resultUrl || !aliveForSession(token)) return
-            const cur = documentStore.getState().cards.find(c => c.id === cardId)
+            const cur = cardsRef.current.find(c => c.id === cardId)
             if (cur?.ttsState?.resultUrl === resultUrl) {
               updateTtsState(cardId, { resultUrl: permanent })
             }
@@ -2228,7 +3416,7 @@ export function useCanvas() {
 
   /** 运行语音克隆节点: 校验输入 → 计费确认 → 提交 */
   function handleRunTts(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const ts = card?.ttsState
     if (!ts) return
     if (ts.jobStatus === 'queued' || ts.jobStatus === 'running') return
@@ -2256,7 +3444,7 @@ export function useCanvas() {
   }
 
   function handleDownloadTts(cardId: string) {
-    const ts = documentStore.getState().cards.find(c => c.id === cardId)?.ttsState
+    const ts = cardsRef.current.find(c => c.id === cardId)?.ttsState
     if (ts?.resultUrl) void downloadAigcResult(ts.resultUrl, ts.resultName)
   }
 
@@ -2316,7 +3504,7 @@ export function useCanvas() {
               const resultUrl = url
               void persistRemoteImage(resultUrl, 'audio').then(permanent => {
                 if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-                  const cur = documentStore.getState().cards.find(c => c.id === job.cardId)
+                  const cur = cardsRef.current.find(c => c.id === job.cardId)
                   if (cur?.ttsState?.resultUrl === resultUrl) updateTtsState(job.cardId, { resultUrl: permanent })
                 }
               })
@@ -2360,7 +3548,7 @@ export function useCanvas() {
         })
         void persistRemoteImage(resultUrl, 'audio').then(permanent => {
           if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-            const cur = documentStore.getState().cards.find(c => c.id === job.cardId)
+            const cur = cardsRef.current.find(c => c.id === job.cardId)
             if (cur?.ttsState?.resultUrl === resultUrl) updateTtsState(job.cardId, { resultUrl: permanent })
           }
         })
@@ -2414,7 +3602,7 @@ export function useCanvas() {
       updateMotionState(cardId, { refImageUrl: localUrl, refImageName: file.name })
       try {
         const url = await persistMedia(file, 'image')
-        if (!documentStore.getState().cards.find(c => c.id === cardId)) return
+        if (!cardsRef.current.find(c => c.id === cardId)) return
         updateMotionState(cardId, { refImageUrl: url, refImageName: file.name })
         setTimeout(() => URL.revokeObjectURL(localUrl), 5000)
       } catch (upErr) {
@@ -2453,7 +3641,7 @@ export function useCanvas() {
     })
     try {
       const url = await persistMedia(file, 'video')
-      if (!documentStore.getState().cards.find(c => c.id === cardId)) return
+      if (!cardsRef.current.find(c => c.id === cardId)) return
       updateMotionState(cardId, {
         refVideoUrl: url,
         refVideoName: file.name,
@@ -2523,7 +3711,7 @@ export function useCanvas() {
       if (aliveForSession(token)) updateMotionState(cardId, patch)
     }
     try {
-      const startCard = documentStore.getState().cards.find(c => c.id === cardId)
+      const startCard = cardsRef.current.find(c => c.id === cardId)
       const start = startCard?.motionState
       if (!start) return
       // 动作迁移的引用素材是 1 图 + 1 视频, 日志按真实媒体类型渲染(视频不再被当破图)
@@ -2588,7 +3776,7 @@ export function useCanvas() {
           // 结果视频 60MB 内静默转永久链接; 超限 persistRemoteImage 原样回平台链接
           void persistRemoteImage(resultUrl, 'video').then(permanent => {
             if (!permanent || permanent === resultUrl || !aliveForSession(token)) return
-            const cur = documentStore.getState().cards.find(c => c.id === cardId)
+            const cur = cardsRef.current.find(c => c.id === cardId)
             if (cur?.motionState?.resultUrl === resultUrl) {
               updateMotionState(cardId, { resultUrl: permanent })
             }
@@ -2630,7 +3818,7 @@ export function useCanvas() {
 
   /** 运行动作迁移节点: 校验输入 → 计费确认 → 提交 */
   function handleRunMotion(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const ms = card?.motionState
     if (!ms) return
     if (ms.jobStatus === 'queued' || ms.jobStatus === 'running') return
@@ -2658,7 +3846,7 @@ export function useCanvas() {
   }
 
   function handleDownloadMotion(cardId: string) {
-    const ms = documentStore.getState().cards.find(c => c.id === cardId)?.motionState
+    const ms = cardsRef.current.find(c => c.id === cardId)?.motionState
     if (ms?.resultUrl) void downloadAigcResult(ms.resultUrl, ms.resultName)
   }
 
@@ -2719,7 +3907,7 @@ export function useCanvas() {
               const resultUrl = url
               void persistRemoteImage(resultUrl, 'video').then(permanent => {
                 if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-                  const cur = documentStore.getState().cards.find(c => c.id === job.cardId)
+                  const cur = cardsRef.current.find(c => c.id === job.cardId)
                   if (cur?.motionState?.resultUrl === resultUrl) updateMotionState(job.cardId, { resultUrl: permanent })
                 }
               })
@@ -2770,7 +3958,7 @@ export function useCanvas() {
         })
         void persistRemoteImage(resultUrl, 'video').then(permanent => {
           if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-            const cur = documentStore.getState().cards.find(c => c.id === job.cardId)
+            const cur = cardsRef.current.find(c => c.id === job.cardId)
             if (cur?.motionState?.resultUrl === resultUrl) updateMotionState(job.cardId, { resultUrl: permanent })
           }
         })
@@ -2810,7 +3998,7 @@ export function useCanvas() {
     updateVsrState(cardId, { videoUrl: localUrl, videoName: file.name, videoDuration: duration ?? undefined })
     try {
       const url = await persistMedia(file, 'video')
-      if (!documentStore.getState().cards.find(c => c.id === cardId)) return
+      if (!cardsRef.current.find(c => c.id === cardId)) return
       updateVsrState(cardId, { videoUrl: url, videoName: file.name, videoDuration: duration ?? undefined })
       setTimeout(() => URL.revokeObjectURL(localUrl), 5000)
     } catch (upErr) {
@@ -2864,7 +4052,7 @@ export function useCanvas() {
       if (aliveForSession(token)) updateVsrState(cardId, patch)
     }
     try {
-      const start = documentStore.getState().cards.find(c => c.id === cardId)?.vsrState
+      const start = cardsRef.current.find(c => c.id === cardId)?.vsrState
       if (!start) return
       // 待修复视频按视频缩略图渲染, 不再被当图片出现破图
       beginSpecialLog(
@@ -2907,7 +4095,7 @@ export function useCanvas() {
           // 结果视频 60MB 内静默转永久链接; 超限原样保留平台链接
           void persistRemoteImage(resultUrl, 'video').then(permanent => {
             if (!permanent || permanent === resultUrl || !aliveForSession(token)) return
-            const cur = documentStore.getState().cards.find(c => c.id === cardId)
+            const cur = cardsRef.current.find(c => c.id === cardId)
             if (cur?.vsrState?.resultUrl === resultUrl) {
               updateVsrState(cardId, { resultUrl: permanent })
             }
@@ -2949,7 +4137,7 @@ export function useCanvas() {
 
   /** 运行视频高清修复节点: 校验输入 → 计费确认 → 提交 */
   function handleRunVsr(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const vs = card?.vsrState
     if (!vs) return
     if (vs.jobStatus === 'queued' || vs.jobStatus === 'running') return
@@ -2974,7 +4162,7 @@ export function useCanvas() {
   }
 
   function handleDownloadVsr(cardId: string) {
-    const vs = documentStore.getState().cards.find(c => c.id === cardId)?.vsrState
+    const vs = cardsRef.current.find(c => c.id === cardId)?.vsrState
     if (vs?.resultUrl) void downloadAigcResult(vs.resultUrl, vs.resultName)
   }
 
@@ -3032,7 +4220,7 @@ export function useCanvas() {
               const resultUrl = url
               void persistRemoteImage(resultUrl, 'video').then(permanent => {
                 if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-                  const cur = documentStore.getState().cards.find(c => c.id === job.cardId)
+                  const cur = cardsRef.current.find(c => c.id === job.cardId)
                   if (cur?.vsrState?.resultUrl === resultUrl) updateVsrState(job.cardId, { resultUrl: permanent })
                 }
               })
@@ -3077,7 +4265,7 @@ export function useCanvas() {
         })
         void persistRemoteImage(resultUrl, 'video').then(permanent => {
           if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-            const cur = documentStore.getState().cards.find(c => c.id === job.cardId)
+            const cur = cardsRef.current.find(c => c.id === job.cardId)
             if (cur?.vsrState?.resultUrl === resultUrl) updateVsrState(job.cardId, { resultUrl: permanent })
           }
         })
@@ -3090,7 +4278,7 @@ export function useCanvas() {
   }
 
   function handleConvertToGenerate(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
     updateCard(cardId, {
       kind: 'generate',
@@ -3188,7 +4376,7 @@ export function useCanvas() {
   }
 
   function handleDuplicateCard(cardId: string) {
-    const src = documentStore.getState().cards.find(c => c.id === cardId)
+    const src = cardsRef.current.find(c => c.id === cardId)
     if (!src) return
     const copy: CanvasCardData = {
       ...src,
@@ -3241,7 +4429,7 @@ export function useCanvas() {
     }
     // 摄影机副本重新分配字母名(同画布复制, 生成节点副本仍指向原摄影机, 绑定保留)
     if (copy.kind === 'camera') {
-      copy.title = cameraTitleFromLetter(nextCameraLetter(documentStore.getState().cards.filter(c => c.kind === 'camera').map(c => c.title ?? '')))
+      copy.title = cameraTitleFromLetter(nextCameraLetter(cardsRef.current.filter(c => c.kind === 'camera').map(c => c.title ?? '')))
       if (copy.cameraState) copy.cameraState = sanitizeCameraConfig(copy.cameraState)
     }
     setCards(prev => [...prev, copy])
@@ -3250,7 +4438,7 @@ export function useCanvas() {
 
   /** 多选/整组复制: 连同组内连线与分组关系一起复制一份, 偏移摆放 */
   function handleDuplicateSelection() {
-    const sel = documentStore.getState().cards.filter(c => selectedIds.includes(c.id))
+    const sel = cardsRef.current.filter(c => selectedIds.includes(c.id))
     if (sel.length < 2) return
     const idMap = new Map(sel.map(c => [c.id, uid()]))
     const gidMap = new Map<string, string>()
@@ -3308,7 +4496,7 @@ export function useCanvas() {
       const copy = copies.find(c => c.id === copyId)
       if (!copy) return
       if (src.kind === 'camera') {
-        const letter = nextCameraLetter(documentStore.getState().cards.filter(c => c.kind === 'camera').map(c => c.title ?? ''), usedLetters)
+        const letter = nextCameraLetter(cardsRef.current.filter(c => c.kind === 'camera').map(c => c.title ?? ''), usedLetters)
         usedLetters.add(letter)
         copy.title = cameraTitleFromLetter(letter)
         if (copy.cameraState) copy.cameraState = sanitizeCameraConfig(copy.cameraState)
@@ -3327,7 +4515,7 @@ export function useCanvas() {
       }
     })
     const selSet = idMap
-    const innerConns = documentStore.getState().connections
+    const innerConns = connectionsRef.current
       .filter(conn => selSet.has(conn.fromId) && selSet.has(conn.toId))
       .map(conn => ({ id: uid(), fromId: selSet.get(conn.fromId) as string, toId: selSet.get(conn.toId) as string }))
     setCards(prev => [...prev, ...copies])
@@ -3339,7 +4527,7 @@ export function useCanvas() {
   function handlePasteImageFile(file: File) {
     return persistMedia(file, 'image')
       .then(url => {
-        const sel = documentStore.getState().cards.filter(c => selectedIds.includes(c.id))
+        const sel = cardsRef.current.filter(c => selectedIds.includes(c.id))
         const target = sel.length === 1 ? sel[0] : undefined
         if (target && target.url && !cardShowsVideo(target)) {
           if (target.kind === 'generate') {
@@ -3384,14 +4572,14 @@ export function useCanvas() {
 
   /** ⌘/Ctrl+C: 选中卡片连同组内连线存入画布剪贴板 */
   function handleCopySelection() {
-    const sel = documentStore.getState().cards.filter(c => selectedIds.includes(c.id))
+    const sel = cardsRef.current.filter(c => selectedIds.includes(c.id))
     if (sel.length === 0) return
     clipboardRef.current = {
       cards: sel.map(c => JSON.parse(JSON.stringify(c)) as CanvasCardData),
       // 连线「任意一端在选中集合内」就带走:
       //  - 两端都被复制 → 粘贴时映射到两个新节点(复制一条完整子链)
       //  - 只有一端被复制 → 新节点连回原来的外部节点(只复制一个下游节点时, 仍引用同一上游参考图)
-      conns: documentStore.getState().connections
+      conns: connectionsRef.current
         .filter(conn => selectedIds.includes(conn.fromId) || selectedIds.includes(conn.toId))
         .map(conn => ({ fromId: conn.fromId, toId: conn.toId, toSlot: conn.toSlot })),
     }
@@ -3527,7 +4715,7 @@ export function useCanvas() {
 
   /** 多选节点对齐 / 等距分布 / 网格整理 */
   function alignSelection(mode: 'left' | 'top' | 'hdist' | 'vdist' | 'grid') {
-    const sel = documentStore.getState().cards.filter(c => selectedIds.includes(c.id))
+    const sel = cardsRef.current.filter(c => selectedIds.includes(c.id))
     if (sel.length < 2) return
     const patch = new Map<string, { x?: number; y?: number }>()
     if (mode === 'left' || mode === 'top') {
@@ -3604,7 +4792,7 @@ export function useCanvas() {
   }
 
   function handleRemoveRefFromCard(cardId: string, url: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
     const next = (card.refUrls ?? []).filter(u => u !== url)
     updateCard(cardId, { refUrls: next })
@@ -3612,7 +4800,7 @@ export function useCanvas() {
   }
 
   function handlePreviewCard(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (card?.url) {
       setPreviewMediaType(cardShowsVideo(card) ? 'video' : 'image')
       setPreviewUrl(card.url)
@@ -3620,7 +4808,7 @@ export function useCanvas() {
   }
 
   function handleDownloadCard(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (card?.url) void downloadAigcResult(card.url)
   }
 
@@ -3632,7 +4820,7 @@ export function useCanvas() {
     if (side === 'right' && selectedIds.includes(cardId) && selectedIds.length > 1) {
       // 不再在此按「是否有任意下游连线」过滤——一张图可能已连到别的节点, 这次仍应能再连到
       // 当前目标; 真正的去重放在松手落地时按 (源→该目标) 判定, 已连过的不重复建。
-      const ids = selectedIds.filter(id => id === cardId || !!documentStore.getState().cards.find(x => x.id === id))
+      const ids = selectedIds.filter(id => id === cardId || !!cardsRef.current.find(x => x.id === id))
       beginConnection(e, ids, side)
       return
     }
@@ -3660,7 +4848,7 @@ export function useCanvas() {
     let bottom = -Infinity
     let collapsedGroup = false
     ids.forEach(id => {
-      const card = documentStore.getState().cards.find(c => c.id === id)
+      const card = cardsRef.current.find(c => c.id === id)
       if (!card) return
       const chip = card.groupId && isGroupCollapsed(card.groupId) ? groupChipRect(card.groupId) : null
       if (chip) {
@@ -3718,7 +4906,7 @@ export function useCanvas() {
       const dx = pt.x - startX
       const dy = pt.y - startY
       const dirLen = Math.hypot(dx, dy) || 1
-      for (const other of documentStore.getState().cards) {
+      for (const other of cardsRef.current) {
         if (ids.includes(other.id)) continue
         // 收纳进折叠组的成员不单独作为吸附目标
         if (other.groupId && isGroupCollapsed(other.groupId)) continue
@@ -3911,7 +5099,7 @@ export function useCanvas() {
   function startResize(e: React.PointerEvent, cardId: string) {
     e.preventDefault()
     e.stopPropagation()
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
     resizingRef.current = true
     // resize 快速路径(同拖卡): 移动期直接写卡片 DOM 宽高 + 几何注册表基准增量,
@@ -4123,7 +5311,7 @@ export function useCanvas() {
       paintMarqueeLayer(null)
       if (!canceled && rect && rect.w > 4 && rect.h > 4) {
         // 收纳组成员按小卡边界命中, 不扫隐藏成员的旧包围盒
-        const hit = documentStore.getState().cards
+        const hit = cardsRef.current
           .filter(c => {
             const gg = c.groupId && isGroupCollapsed(c.groupId) ? groupChipRect(c.groupId) : null
             const rx = gg ? gg.x : c.x
@@ -4205,9 +5393,9 @@ export function useCanvas() {
 
   /** 同组成员 id 列表; 未分组返回自身 */
   function groupMemberIds(cardId: string): string[] {
-    const gid = documentStore.getState().cards.find(c => c.id === cardId)?.groupId
+    const gid = cardsRef.current.find(c => c.id === cardId)?.groupId
     if (!gid) return [cardId]
-    return documentStore.getState().cards.filter(c => c.groupId === gid).map(c => c.id)
+    return cardsRef.current.filter(c => c.groupId === gid).map(c => c.id)
   }
 
   function handleGroupSelection() {
@@ -4224,7 +5412,7 @@ export function useCanvas() {
 
   function handleUngroupSelection() {
     const gids = new Set(
-      documentStore.getState().cards.filter(c => selectedIds.includes(c.id)).map(c => c.groupId).filter((g): g is string => !!g),
+      cardsRef.current.filter(c => selectedIds.includes(c.id)).map(c => c.groupId).filter((g): g is string => !!g),
     )
     if (!gids.size) return
     setCards(prev => prev.map(c => (c.groupId && gids.has(c.groupId) ? { ...c, groupId: undefined, groupName: undefined, groupCollapsed: undefined } : c)))
@@ -4237,12 +5425,12 @@ export function useCanvas() {
 
   function isGroupCollapsed(gid?: string): boolean {
     if (!gid) return false
-    return documentStore.getState().cards.some(c => c.groupId === gid && c.groupCollapsed)
+    return cardsRef.current.some(c => c.groupId === gid && c.groupCollapsed)
   }
 
   /** 收纳小卡位置: 取组成员包围盒中心, 固定尺寸 */
   function groupChipRect(gid: string): { x: number; y: number; w: number; h: number } | null {
-    const arr = documentStore.getState().cards.filter(c => c.groupId === gid)
+    const arr = cardsRef.current.filter(c => c.groupId === gid)
     if (!arr.length) return null
     const left = Math.min(...arr.map(c => c.x))
     const right = Math.max(...arr.map(c => c.x + c.w))
@@ -4265,7 +5453,7 @@ export function useCanvas() {
   /** 工具条入口: 对选中的组整体收纳 / 恢复 */
   function handleCollapseSelection(collapsed: boolean) {
     const gids = new Set(
-      documentStore.getState().cards.filter(c => selectedIds.includes(c.id)).map(c => c.groupId).filter((g): g is string => !!g),
+      cardsRef.current.filter(c => selectedIds.includes(c.id)).map(c => c.groupId).filter((g): g is string => !!g),
     )
     gids.forEach(gid => setGroupCollapsed(gid, collapsed))
   }
@@ -4280,10 +5468,10 @@ export function useCanvas() {
     e.preventDefault()
     if (addMenuPos) setAddMenuPos(null)
     const origins: Record<string, { x: number; y: number }> = {}
-    documentStore.getState().cards.forEach(c => {
+    cardsRef.current.forEach(c => {
       if (ids.includes(c.id)) origins[c.id] = { x: c.x, y: c.y }
     })
-    const first = documentStore.getState().cards.find(c => c.id === ids[0])
+    const first = cardsRef.current.find(c => c.id === ids[0])
     const collapsed = !!first?.groupId && isGroupCollapsed(first.groupId)
     gestureRef.current = {
       type: 'drag',
@@ -4319,7 +5507,7 @@ export function useCanvas() {
       lastTap.t = 0
       suppressStageDblRef.current = true
       setTimeout(() => { suppressStageDblRef.current = false }, 350)
-      const dblCard = documentStore.getState().cards.find(c => c.id === cardId)
+      const dblCard = cardsRef.current.find(c => c.id === cardId)
       if (dblCard) {
         if (dblCard.kind === 'generate') handleToggleNodePanel(cardId)
         else if (dblCard.url) handlePreviewCard(cardId)
@@ -4347,7 +5535,7 @@ export function useCanvas() {
     const dragIds = base.length > 1 ? nextSel : members
     const origins: Record<string, { x: number; y: number }> = {}
     dragIds.forEach(id => {
-      const c = documentStore.getState().cards.find(cc => cc.id === id)
+      const c = cardsRef.current.find(cc => cc.id === id)
       if (c) origins[id] = { x: c.x, y: c.y }
     })
     // 先不提交选中状态，避免按住节点拖动时立即弹出设置面板；抬起鼠标后再确认选中。
@@ -4430,8 +5618,8 @@ export function useCanvas() {
   /** 框住全部内容: 自动缩放/平移让所有节点都在视野内; 空画布回到默认视图 */
   /** F 键: 有选中节点就框住选中, 否则框住全部内容; 空画布回默认视图 */
   function handleFrameContent() {
-    const sel = documentStore.getState().cards.filter(c => selectedIdsRef.current.includes(c.id))
-    frameCards(sel.length ? sel : documentStore.getState().cards)
+    const sel = cardsRef.current.filter(c => selectedIdsRef.current.includes(c.id))
+    frameCards(sel.length ? sel : cardsRef.current)
   }
 
   /** 把给定一组节点居中并缩放到视野内 */
@@ -4521,9 +5709,9 @@ export function useCanvas() {
       ? null
       : inheritCropContext([
           card,
-          ...documentStore.getState().connections
+          ...connectionsRef.current
             .filter(conn => conn.toId === card.id)
-            .map(conn => documentStore.getState().cards.find(c => c.id === conn.fromId))
+            .map(conn => cardsRef.current.find(c => c.id === conn.fromId))
             .filter((c): c is CanvasCardData => !!c),
         ])
     // AI 应用渠道: 不走标准 openapi body, 字段平铺给该应用; 单次只出 1 个视频
@@ -4624,7 +5812,7 @@ export function useCanvas() {
   }
 
   function handleRunGenerateNode(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
     const params = card.genParams ?? defaultGenParams()
     const err = validateGenerateNode(card, params)
@@ -4794,12 +5982,12 @@ export function useCanvas() {
   /** 标准 AIGC / AI 应用统一管线(runJob)的提交快照: 提示词/参考图/开始时间 */
   const specLogMetaRef = useRef(new WeakMap<JobSpec, { startedAt: number; refs: string[] }>())
   function beginSpecLog(spec: JobSpec) {
-    const ownerCard = documentStore.getState().cards.find(c => c.id === (spec.nodeId ?? spec.resultCardId))
+    const ownerCard = cardsRef.current.find(c => c.id === (spec.nodeId ?? spec.resultCardId))
     const refs =
       spec.refs ??
       (ownerCard
         ? effectiveRefUrls(ownerCard)
-        : (spec.sourceCardId ? documentStore.getState().cards.find(c => c.id === spec.sourceCardId)?.refUrls ?? [] : []))
+        : (spec.sourceCardId ? cardsRef.current.find(c => c.id === spec.sourceCardId)?.refUrls ?? [] : []))
     specLogMetaRef.current.set(spec, { startedAt: Date.now(), refs: refs.filter(Boolean).slice(0, 9) })
   }
   /** 统一管线收尾写日志(仅终态 success/failed; aborted/会话失效不写) */
@@ -4809,7 +5997,7 @@ export function useCanvas() {
   ) {
     if (out.jobStatus !== 'success' && out.jobStatus !== 'failed') return
     const meta = specLogMetaRef.current.get(spec)
-    const ownerCard = documentStore.getState().cards.find(c => c.id === (spec.nodeId ?? spec.resultCardId))
+    const ownerCard = cardsRef.current.find(c => c.id === (spec.nodeId ?? spec.resultCardId))
     const refs = meta?.refs ?? spec.refs ?? (ownerCard ? effectiveRefUrls(ownerCard) : [])
     appendGenLog({
       status: out.jobStatus,
@@ -4957,7 +6145,7 @@ export function useCanvas() {
       if (spec.nodeId !== undefined && spec.resultIndex !== undefined) {
         replaceNodeResultUrl(spec.nodeId, spec.resultIndex, url, permanent)
       } else {
-        const cur = documentStore.getState().cards.find(c => c.id === spec.resultCardId)
+        const cur = cardsRef.current.find(c => c.id === spec.resultCardId)
         if (cur && cur.url === url) updateCard(spec.resultCardId, { url: permanent })
       }
     })
@@ -4974,7 +6162,7 @@ export function useCanvas() {
         (spec.body.imageUrl as string | undefined) ||
         spec.body.referenceImage as string | undefined ||
         ''
-      if (!frameUrl) frameUrl = effectiveRefUrls(documentStore.getState().cards.find(c => c.id === (spec.nodeId ?? spec.resultCardId)) ?? ({} as CanvasCardData))[0] ?? ''
+      if (!frameUrl) frameUrl = effectiveRefUrls(cardsRef.current.find(c => c.id === (spec.nodeId ?? spec.resultCardId)) ?? ({} as CanvasCardData))[0] ?? ''
       // 重试 / 续跑时 spec.body 已按所选 AI 应用渠道平铺好(node51 或 node438/node446), 原样复用;
       // 历史遗留 body 缺标量字段时再按当前渠道兜底重建。
       const text = typeof spec.body.text === 'string' ? spec.body.text : spec.promptText
@@ -5081,7 +6269,7 @@ export function useCanvas() {
   }
 
   function handleRetryCard(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const cardModel = card?.model
     if (!card || !cardModel) return
     const lockKey = `card:${cardId}`
@@ -5127,7 +6315,7 @@ export function useCanvas() {
 
   /** 生成节点失败结果项的单项重试: 同参数/同提示词/同上游重跑, 写回同一项(不影响其他结果) */
   function handleRetryNodeResult(cardId: string, resultIndex: number) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const item = card?.results?.[resultIndex]
     if (!card || !item) return
     // 模型优先取节点当前选定渠道(浮条上可换): 换过渠道则旧 runBody 属于旧模型契约, 丢弃重建
@@ -5204,14 +6392,14 @@ export function useCanvas() {
       prev.map(c => (c.id === cardId ? { ...c, genParams: { ...defaultGenParams(), ...c.genParams, ...patch } } : c)),
     )
     if (patch.model || patch.resolution || patch.videoDuration || patch.quality || patch.aspectRatio) {
-      const card = documentStore.getState().cards.find(c => c.id === cardId)
+      const card = cardsRef.current.find(c => c.id === cardId)
       const merged = { ...defaultGenParams(), ...card?.genParams, ...patch }
       refreshModelPrice(merged.model, card ? effectiveRefUrls(card) : [], merged)
     }
   }
 
   function handleUpdateSelectedGenParams(patch: Partial<GenNodeParams>) {
-    const targets = documentStore.getState().cards.filter(c => selectedIds.includes(c.id) && c.kind === 'generate')
+    const targets = cardsRef.current.filter(c => selectedIds.includes(c.id) && c.kind === 'generate')
     if (!targets.length) return
     setCards(prev =>
       prev.map(c =>
@@ -5232,14 +6420,14 @@ export function useCanvas() {
   useEffect(() => {
     setBatchSettingsReady(false)
     const soloId = selectedIds.length === 1 ? selectedIds[0] : null
-    const soloCard = soloId ? documentStore.getState().cards.find(c => c.id === soloId) : undefined
+    const soloCard = soloId ? cardsRef.current.find(c => c.id === soloId) : undefined
     // 拖动卡片松手造成的选中: 不自动弹出面板(区分「移动」与「原地点击」), 标记只读一次
     const dragged = suppressAutoPanelRef.current
     suppressAutoPanelRef.current = false
     // 已接下游(融合/生成/润色等任意节点)的生成节点默认收起, 避免点击图片或节点时参数面板弹出遮挡;
     // 没有下游时, 原地点击选中即展开面板
     const hasOutgoing =
-      !!soloCard && soloCard.kind === 'generate' && documentStore.getState().connections.some(conn => conn.fromId === soloId)
+      !!soloCard && soloCard.kind === 'generate' && connectionsRef.current.some(conn => conn.fromId === soloId)
     if (soloCard && soloCard.kind === 'generate' && !hasOutgoing && !dragged) {
       setEditNodeId(soloId)
       return
@@ -5297,7 +6485,7 @@ export function useCanvas() {
       flushAfterMediaSaved(cardId)
       // 稍后再释放本地预览, 等视图完全切到云端地址
       setTimeout(() => URL.revokeObjectURL(localUrl), 5000)
-      const curParams = documentStore.getState().cards.find(c => c.id === cardId)?.genParams
+      const curParams = cardsRef.current.find(c => c.id === cardId)?.genParams
       refreshModelPrice(curParams?.model ?? I2I_MODELS[0], [url], curParams)
     } catch {
       updateCard(cardId, { url: undefined, jobStatus: undefined, w: 320, h: 180 })
@@ -5445,7 +6633,7 @@ export function useCanvas() {
             const cardId = job.cardId
             void persistRemoteImage(resultUrl).then(permanent => {
               if (permanent && permanent !== resultUrl && aliveForSession(sessionToken)) {
-                const cur = documentStore.getState().cards.find(c => c.id === cardId)
+                const cur = cardsRef.current.find(c => c.id === cardId)
                 if (cur && cur.url === resultUrl) updateCard(cardId, { url: permanent })
               }
             })
@@ -5519,13 +6707,13 @@ export function useCanvas() {
             if (permanent && permanent !== appVideoUrl && aliveForSession(sessionToken)) {
               if (resultIndex !== undefined) replaceNodeResultUrl(cardId, resultIndex, appVideoUrl, permanent)
               else {
-                const cur = documentStore.getState().cards.find(c => c.id === cardId)
+                const cur = cardsRef.current.find(c => c.id === cardId)
                 if (cur && cur.url === appVideoUrl) updateCard(cardId, { url: permanent })
               }
             }
           })
         }
-        const aiResumeCard = documentStore.getState().cards.find(c => c.id === cardId)
+        const aiResumeCard = cardsRef.current.find(c => c.id === cardId)
         appendRestoredLog({
           status: 'success',
           platform: logPlatformOf(slug),
@@ -5542,7 +6730,7 @@ export function useCanvas() {
         const aiResumeError = formatAiAppFailureMessage(res)
         if (resultIndex !== undefined) patchNodeResult(cardId, resultIndex, { itemStatus: 'failed', errorMsg: aiResumeError })
         else updateCard(cardId, { jobStatus: 'failed', errorMsg: aiResumeError })
-        const aiResumeCard = documentStore.getState().cards.find(c => c.id === cardId)
+        const aiResumeCard = cardsRef.current.find(c => c.id === cardId)
         appendRestoredLog({
           status: 'failed',
           platform: logPlatformOf(slug),
@@ -5597,7 +6785,7 @@ export function useCanvas() {
         } else {
           updateCard(cardId, patch)
         }
-        const resumeCard = documentStore.getState().cards.find(c => c.id === cardId)
+        const resumeCard = cardsRef.current.find(c => c.id === cardId)
         const resumeNodeType = resultIndex !== undefined ? '生成节点' : resumeCard?.loopSourceId || resumeCard?.loopSlotIndex !== undefined ? 'Loop' : '生成节点'
         appendRestoredLog({
           status: 'success',
@@ -5615,7 +6803,7 @@ export function useCanvas() {
         const resumeError = formatAigcFailureMessage(res)
         if (resultIndex !== undefined) patchNodeResult(cardId, resultIndex, { itemStatus: 'failed', errorMsg: resumeError })
         else updateCard(cardId, { jobStatus: 'failed', errorMsg: resumeError })
-        const resumeCard = documentStore.getState().cards.find(c => c.id === cardId)
+        const resumeCard = cardsRef.current.find(c => c.id === cardId)
         appendRestoredLog({
           status: 'failed',
           platform: logPlatformOf(modelKey),
@@ -5757,7 +6945,7 @@ export function useCanvas() {
   }
 
   async function handleSaveCardToAssets(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card?.url) return
     if (!getLocalAccount()) { setAuthDialog('login'); return }
     const isVideoCard = cardShowsVideo(card)
@@ -6025,7 +7213,7 @@ export function useCanvas() {
     const medias: Array<{ url: string; isVideo: boolean; displayName: string }> = []
     let skipped = 0
     cardIds.forEach(id => {
-      const card = documentStore.getState().cards.find(c => c.id === id)
+      const card = cardsRef.current.find(c => c.id === id)
       const media = cardMediaOf(card)
       if (!card || !media || !media.url) {
         skipped += 1
@@ -6102,8 +7290,8 @@ export function useCanvas() {
 
   /** 头部按钮: 保存当前选中节点为工作流 */
   async function handleSaveSelectedToWorkflow(scope: 'global' | 'project', folderId: string): Promise<boolean> {
-    const sel = documentStore.getState().cards.filter(c => selectedIdsRef.current.includes(c.id))
-    const selection = buildWorkflowSelection(sel, documentStore.getState().connections)
+    const sel = cardsRef.current.filter(c => selectedIdsRef.current.includes(c.id))
+    const selection = buildWorkflowSelection(sel, connectionsRef.current)
     if (!selection || selection.cards.length < 2) {
       toast.error('请选中至少一个生成节点和它的输入节点')
       return false
@@ -6111,7 +7299,7 @@ export function useCanvas() {
     if (selection.skippedUnrelated > 0) {
       toast.message(`已跳过 ${selection.skippedUnrelated} 个无关节点`)
     }
-    let doc = serializeWorkflow(selection.cards, documentStore.getState().connections)
+    let doc = serializeWorkflow(selection.cards, connectionsRef.current)
 
     // 直接挂载的参考图(含 layer/rep 等专用节点状态内的上传图): 临时链接先转永久再存(失败保留原链接)
     const mediaUrls = collectWorkflowMediaUrls(doc)
@@ -6177,7 +7365,7 @@ export function useCanvas() {
     // 重建后的摄影机按当前画布重新分配字母名(避免与画布已有摄影机重名), 同步绑定快照名
     renameRebuiltCameras(
       rebuilt.cards,
-      documentStore.getState().cards.filter(c => c.kind === 'camera').map(c => c.title ?? ''),
+      cardsRef.current.filter(c => c.kind === 'camera').map(c => c.title ?? ''),
     )
     setCards(prev => [...prev, ...rebuilt.cards])
     setConnections(prev => [...prev, ...rebuilt.connections])
@@ -6304,7 +7492,7 @@ export function useCanvas() {
   function applyPickedEntry(entry: AssetLibEntry) {
     if (!assetPickerFor) return
     const { cardId, slot } = assetPickerFor
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) {
       setAssetPickerFor(null)
       return
@@ -6386,7 +7574,7 @@ export function useCanvas() {
   }
 
   function handleAnalyzeLayers(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const ls = card?.layerState
     const source = effectiveLayerSource(cardId)
     if (!ls || !source) {
@@ -6439,14 +7627,14 @@ export function useCanvas() {
   }
 
   function handleToggleLayer(cardId: string, layerId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const layer = card?.layerState?.layers.find(l => l.id === layerId)
     if (!layer) return
     updateLayerFor(cardId, layerId, { enabled: !layer.enabled })
   }
 
   function handleDeleteLayer(cardId: string, layerId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card?.layerState) return
     patchLayerState(cardId, { layers: card.layerState.layers.filter(l => l.id !== layerId) })
   }
@@ -6499,7 +7687,7 @@ export function useCanvas() {
           // 分层结果图后台转存永久链接, 完成后静默替换, 避免次日裂图
           void persistRemoteImage(url).then(permanent => {
             if (permanent && permanent !== url && aliveForSession(sessionToken)) {
-              const cur = documentStore.getState().cards.find(c => c.id === cardId)?.layerState?.layers.find(l => l.id === layer.id)
+              const cur = cardsRef.current.find(c => c.id === cardId)?.layerState?.layers.find(l => l.id === layer.id)
               if (cur && cur.genUrl === url) updateLayerFor(cardId, layer.id, { genUrl: permanent })
             }
           })
@@ -6546,7 +7734,7 @@ export function useCanvas() {
   }
 
   function handleGenerateLayers(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const ls = card?.layerState
     if (!ls) return
     const targets = ls.layers.filter(l => l.enabled)
@@ -6580,7 +7768,7 @@ export function useCanvas() {
     const sessionToken = sessionTokenRef.current
     patchLayerState(cardId, { stage: 'generating' })
     patchLayerState(cardId, {
-      layers: (documentStore.getState().cards.find(c => c.id === cardId)?.layerState?.layers ?? []).map(l =>
+      layers: (cardsRef.current.find(c => c.id === cardId)?.layerState?.layers ?? []).map(l =>
         l.enabled ? { ...l, genStatus: 'queued' as const, errorMsg: null } : l,
       ),
     })
@@ -6593,7 +7781,7 @@ export function useCanvas() {
   }
 
   function handleRetryLayer(cardId: string, layerId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const layer = card?.layerState?.layers.find(l => l.id === layerId)
     const source = effectiveLayerSource(cardId)
     if (!card || !layer || !source || !card.layerState) return
@@ -6616,7 +7804,7 @@ export function useCanvas() {
   }
 
   function handleDownloadAllLayers(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const done = (card?.layerState?.layers ?? []).filter(l => l.genStatus === 'success')
     if (!done.length) {
       toast.error('还没有生成成功的图层')
@@ -6629,7 +7817,7 @@ export function useCanvas() {
 
   /** 切换折页类型: 折面数量随之变化(三折 3 / 二折 2), 已有文案尽量保留 */
   function handleRepSetFoldType(cardId: string, foldType: FoldType) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     if (!rs || rs.foldType === foldType) return
     const n = foldPanelCount(foldType)
@@ -6674,7 +7862,7 @@ export function useCanvas() {
    *  本地上传改上传字段, 连线(含无槽通用线)改 toSlot 归属, 空格参与时把来源挪过去。 */
   function handleRepReorderSlots(cardId: string, fromSlot: RepSlot, toSlot: RepSlot) {
     if (fromSlot === toSlot) return
-    const rs = documentStore.getState().cards.find(c => c.id === cardId)?.repState
+    const rs = cardsRef.current.find(c => c.id === cardId)?.repState
     if (!rs) return
     const sources = resolveRepSlotSources(cardId)
     const a = sources[fromSlot]
@@ -6722,7 +7910,7 @@ export function useCanvas() {
   }
 
   function handleAnalyzeReplicate(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     const { front, back } = effectiveRepUrls(cardId)
     if (!rs || !front || !back) {
@@ -6739,7 +7927,7 @@ export function useCanvas() {
    */
   async function runReplicateAnalysis(cardId: string) {
     const token = sessionTokenRef.current
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     if (!rs) return
     const { front, back } = effectiveRepUrls(cardId)
@@ -6796,7 +7984,7 @@ export function useCanvas() {
 
     // 阶段 B: 设计规律 + 文案 + 素材 → 整合模型编译正反两条生图提示词
     const analyzeModel = rs.analyzeModel || 'qwen3.8-max'
-    const latest = documentStore.getState().cards.find(c => c.id === cardId)?.repState ?? rs
+    const latest = cardsRef.current.find(c => c.id === cardId)?.repState ?? rs
     const latestSlots = effectiveRepSlots(cardId)
     const directorRes = await runLlmGuarded(analyzeModel, {
       messages: [
@@ -6849,7 +8037,7 @@ export function useCanvas() {
 
   /** 六个折面文案框各自的润色: 固定走豆包 Seed 2.0 Lite, 只润色该格用户输入的文案 */
   function handlePolishRepPanel(cardId: string, side: 'front' | 'back', idx: number) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     if (!rs) return
     const panels = side === 'front' ? rs.frontPanels : rs.backPanels
@@ -6880,7 +8068,7 @@ export function useCanvas() {
           return
         }
         const polished = res.text.trim()
-        const cur = documentStore.getState().cards.find(c => c.id === cardId)?.repState
+        const cur = cardsRef.current.find(c => c.id === cardId)?.repState
         const src = side === 'front' ? cur?.frontPanels ?? panels : cur?.backPanels ?? panels
         handleRepPanelsChange(cardId, side, src.map((v, i) => (i === idx ? polished : v)))
         toast.success('润色完成')
@@ -6891,9 +8079,9 @@ export function useCanvas() {
   }
 
   function handleRunPolishNode(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
-    const source = card.sourceCardId ? documentStore.getState().cards.find(c => c.id === card.sourceCardId) : undefined
+    const source = card.sourceCardId ? cardsRef.current.find(c => c.id === card.sourceCardId) : undefined
     // 用户在本润色节点输入框里实际填写/改写的指令优先; 框为空时才回退到源生成节点的描述
     const current = ((card.prompt ?? '').trim() || (source?.prompt ?? '').trim())
     // 图片输入: 下游生成节点图 + 上游连线图, 去重后取 4 张; 有图即可看图反推描述
@@ -6915,7 +8103,7 @@ export function useCanvas() {
   }
 
   async function runPolishNode(cardId: string, current: string, images: string[]) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
     const base = { ...defaultPolishState(), ...card.polishState }
     // 带图任务必须视觉模型: 当前是纯文本模型时自动切换
@@ -6946,7 +8134,7 @@ export function useCanvas() {
       }
       const polished = res.text.trim()
       updateCard(cardId, { prompt: polished, polishState: { ...state, jobStatus: 'success', result: polished } })
-      const src = card.sourceCardId ? documentStore.getState().cards.find(c => c.id === card.sourceCardId) : undefined
+      const src = card.sourceCardId ? cardsRef.current.find(c => c.id === card.sourceCardId) : undefined
       if (src) updateCard(src.id, { prompt: polished })
       toast.success('提示词润色完成')
     } catch {
@@ -6963,7 +8151,7 @@ export function useCanvas() {
    */
   function handleInlinePolishGenerate(cardId: string) {
     if (polishingGenId) return
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card || card.kind !== 'generate') return
     const current = (card.prompt ?? '').trim()
     // 只取已持久化的可访问链接; 仍在上传的 blob: 本地预览不发给模型
@@ -7076,7 +8264,7 @@ export function useCanvas() {
   function collectExportItems(cardIds: string[]): Array<{ url: string; name?: string; isVideo?: boolean }> {
     const items: Array<{ url: string; name?: string; isVideo?: boolean }> = []
     cardIds.forEach(id => {
-      const c = documentStore.getState().cards.find(x => x.id === id)
+      const c = cardsRef.current.find(x => x.id === id)
       if (!c) return
       const okResults = (Array.isArray(c.results) ? c.results : [])
         .filter(r => r.itemStatus === 'success' && r.url)
@@ -7195,10 +8383,10 @@ export function useCanvas() {
 
   /** 直连上游的文本(Agent 输出 / 提示词节点 / 生成节点描述) */
   function upstreamTexts(cardId: string): string[] {
-    const fromIds = documentStore.getState().connections.filter(c => c.toId === cardId).map(c => c.fromId)
+    const fromIds = connectionsRef.current.filter(c => c.toId === cardId).map(c => c.fromId)
     const texts: string[] = []
     fromIds.forEach(fid => {
-      const up = documentStore.getState().cards.find(c => c.id === fid)
+      const up = cardsRef.current.find(c => c.id === fid)
       if (!up) return
       const t = up.kind === 'agent' ? (up.agentState?.output || up.prompt || '') : (up.prompt ?? '')
       if (t.trim()) texts.push(t.trim())
@@ -7207,7 +8395,7 @@ export function useCanvas() {
   }
 
   function handleUpdateAgentState(cardId: string, patch: Partial<AgentNodeState>) {
-    const cur = documentStore.getState().cards.find(c => c.id === cardId)?.agentState ?? defaultAgentState()
+    const cur = cardsRef.current.find(c => c.id === cardId)?.agentState ?? defaultAgentState()
     updateCard(cardId, { agentState: { ...cur, ...patch } })
   }
 
@@ -7225,7 +8413,7 @@ export function useCanvas() {
   }
 
   function handleRunAgentNode(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     if (!card) return
     const st0 = { ...defaultAgentState(), ...card.agentState }
     const requirement = (card.prompt ?? '').trim()
@@ -7239,7 +8427,7 @@ export function useCanvas() {
     costConfirm.runWithCostConfirm(async () => {
       if (!acquireRunLock(lockKey)) return
       try {
-        const curCard = documentStore.getState().cards.find(c => c.id === cardId)
+        const curCard = cardsRef.current.find(c => c.id === cardId)
         if (!curCard) return
         const st = { ...defaultAgentState(), ...curCard.agentState }
         const upTexts = upstreamTexts(cardId)
@@ -7270,7 +8458,7 @@ export function useCanvas() {
         updateCard(cardId, { agentState: { ...st, jobStatus: 'running', errorMsg: null } })
         const res = await runLlmGuarded(st.model, { messages, page: 'canvas' })
         if (res.needsLogin) setNeedsRhLogin(true)
-        const cur = documentStore.getState().cards.find(c => c.id === cardId)?.agentState ?? st
+        const cur = cardsRef.current.find(c => c.id === cardId)?.agentState ?? st
         if (!res.ok || !res.text) {
           updateCard(cardId, { agentState: { ...cur, jobStatus: 'failed', errorMsg: llmErrorText(res) } })
           return
@@ -7298,7 +8486,7 @@ export function useCanvas() {
           updateCard(cardId, { agentState: { ...cur, tableRows: merged, jobStatus: 'success', errorMsg: null } })
         }
       } catch {
-        const latest = documentStore.getState().cards.find(c => c.id === cardId)?.agentState ?? st0
+        const latest = cardsRef.current.find(c => c.id === cardId)?.agentState ?? st0
         updateCard(cardId, { agentState: { ...latest, jobStatus: 'failed', errorMsg: '运行失败, 请稍后重试' } })
       } finally {
         releaseRunLock(lockKey)
@@ -7310,10 +8498,10 @@ export function useCanvas() {
 
   /** 上游 Agent 输出拆成批量任务: 表格一行一任务; 文本按编号/换行拆分 */
   function loopTasks(cardId: string): Array<{ prompt: string; rowDriven: boolean }> {
-    const fromIds = documentStore.getState().connections.filter(c => c.toId === cardId).map(c => c.fromId)
+    const fromIds = connectionsRef.current.filter(c => c.toId === cardId).map(c => c.fromId)
     const tasks: Array<{ prompt: string; rowDriven: boolean }> = []
     fromIds.forEach(fid => {
-      const up = documentStore.getState().cards.find(c => c.id === fid)
+      const up = cardsRef.current.find(c => c.id === fid)
       if (!up || up.kind !== 'agent' || !up.agentState) return
       const st = up.agentState
       if (st.tableMode) {
@@ -7341,17 +8529,17 @@ export function useCanvas() {
   function loopSharedRefs(cardId: string): string[] {
     const set = new Set<string>()
     upstreamImageUrls(cardId).forEach(u => set.add(u))
-    documentStore.getState().connections
+    connectionsRef.current
       .filter(c => c.toId === cardId)
       .forEach(c => {
-        const up = documentStore.getState().cards.find(x => x.id === c.fromId)
+        const up = cardsRef.current.find(x => x.id === c.fromId)
         if (up?.kind === 'agent') upstreamImageUrls(up.id).forEach(u => set.add(u))
       })
     return [...set].slice(0, 9)
   }
 
   function handleUpdateLoopState(cardId: string, patch: Partial<LoopNodeState>) {
-    const cur = documentStore.getState().cards.find(c => c.id === cardId)?.loopState ?? defaultLoopState()
+    const cur = cardsRef.current.find(c => c.id === cardId)?.loopState ?? defaultLoopState()
     updateCard(cardId, { loopState: { ...cur, ...patch } })
   }
 
@@ -7363,7 +8551,7 @@ export function useCanvas() {
   }
 
   async function handleRunLoop(cardId: string) {
-    const loop = documentStore.getState().cards.find(c => c.id === cardId)
+    const loop = cardsRef.current.find(c => c.id === cardId)
     if (!loop) return
     const st = { ...defaultLoopState(), ...loop.loopState }
     const allTasks = loopTasks(cardId)
@@ -7410,9 +8598,9 @@ export function useCanvas() {
             ? null
             : inheritCropContext([
                 loop,
-                ...documentStore.getState().connections
+                ...connectionsRef.current
                   .filter(conn => conn.toId === cardId)
-                  .map(conn => documentStore.getState().cards.find(c => c.id === conn.fromId))
+                  .map(conn => cardsRef.current.find(c => c.id === conn.fromId))
                   .filter((c): c is CanvasCardData => !!c),
               ])
           const out: CanvasCardData = {
@@ -7462,7 +8650,7 @@ export function useCanvas() {
   }
 
   function handleRunReplicate(cardId: string) {
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     if (!rs) return
     const { front, back } = effectiveRepUrls(cardId)
@@ -7479,7 +8667,7 @@ export function useCanvas() {
 
   async function runReplicateGeneration(cardId: string) {
     const token = sessionTokenRef.current
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     if (!rs) return
     const { front, back } = effectiveRepUrls(cardId)
@@ -7567,7 +8755,7 @@ export function useCanvas() {
 
   function applyRepResult(cardId: string, side: 'front' | 'back', res: AigcResult, sessionToken?: number) {
     const sideLabel = side === 'front' ? '正面' : '背面'
-    const card = documentStore.getState().cards.find(c => c.id === cardId)
+    const card = cardsRef.current.find(c => c.id === cardId)
     const rs = card?.repState
     const baseJob = rs?.jobStatus ?? { front: 'idle' as const, back: 'idle' as const }
     if (res.status === 'success') {
@@ -7646,7 +8834,7 @@ export function useCanvas() {
 
   return {
     // 文档与顶栏
-    docLoaded, canvasTitle, setCanvasTitle, saveState,
+    docLoaded, canvasTitle, setCanvasTitle, saveState, prepareAgentTurn, syncAgentRevision, focusAgentNode,
     // 多标签保存冲突
     saveConflict, resolveConflictReload, resolveConflictOverwrite, flushPersistNow,
     // 崩溃本地恢复
